@@ -2,12 +2,12 @@
 
 Servo miServo;
 
-const int pinFlex = A1;
-const int pinServo = 2;
+const int pinFlex = A0;
+const int pinServo = 9;
 
 // Ajusta estos números con tus valores del Monitor Serie
-const int flexPlano = 700;   
-const int flexDoblado = 900; 
+const int flexPlano = 600;   
+const int flexDoblado = 700; 
 
 // Variables para el suavizado (Filtro)
 int lecturaAnterior = 0;
