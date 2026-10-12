@@ -14,6 +14,8 @@
     // Comunicación ESP-NOW guante -> mano
     { "name": "3. ESP-NOW - Transmisor_C3", "path": "Prueba_ESPNOW/Transmisor_C3" },
     { "name": "3. ESP-NOW - Receptor_ESP32", "path": "Prueba_ESPNOW/Receptor_ESP32" },
+    // Flex 1 del guante (C3) -> servo de la mano (ESP32): un proyecto, dos entornos
+    { "name": "3. ESP-NOW - Prueba_Servo_Sensor", "path": "Prueba_Servo_Sensor" },
     // Pruebas iniciales con Arduino Uno
     { "name": "4. Arduino - Pruebas_funcionales_flex_servos", "path": "Pruebas_funcionales_flex_servos_arduino" },
     { "name": "4. Arduino - prueba_5_sensores_flex", "path": "prueba_5_sensores_flex_arduino" },
@@ -30,5 +32,75 @@
     "platformio-ide.activateProjectOnTextEditorChange": true,
     // Oculta las carpetas de compilación de PlatformIO
     "files.exclude": { "**/.pio": true }
+  },
+  // Terminal > Run Task... > "ESP-NOW: monitor transmisor + receptor"
+  // abre los dos monitores serie lado a lado (cerrar con el tachito antes de subir codigo)
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "Servo-Sensor: monitor receptor (ESP32, COM3)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["device", "monitor", "-d", "${workspaceFolder:3. ESP-NOW - Prueba_Servo_Sensor}", "-e", "receptor_esp32"],
+        "isBackground": true,
+        "problemMatcher": [],
+        "presentation": { "group": "servosensor", "panel": "dedicated", "reveal": "always", "focus": false }
+      },
+      {
+        "label": "Servo-Sensor: monitor transmisor (C3, COM5)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["device", "monitor", "-d", "${workspaceFolder:3. ESP-NOW - Prueba_Servo_Sensor}", "-e", "transmisor_c3"],
+        "isBackground": true,
+        "problemMatcher": [],
+        "presentation": { "group": "servosensor", "panel": "dedicated", "reveal": "always", "focus": true }
+      },
+      {
+        "label": "Servo-Sensor: monitor transmisor + receptor",
+        "dependsOn": ["Servo-Sensor: monitor receptor (ESP32, COM3)", "Servo-Sensor: monitor transmisor (C3, COM5)"],
+        "dependsOrder": "parallel",
+        "problemMatcher": []
+      },
+      {
+        "label": "Servo-Sensor: subir transmisor (C3)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["run", "-d", "${workspaceFolder:3. ESP-NOW - Prueba_Servo_Sensor}", "-e", "transmisor_c3", "-t", "upload"],
+        "problemMatcher": []
+      },
+      {
+        "label": "Servo-Sensor: subir receptor (ESP32, mantener BOOT)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["run", "-d", "${workspaceFolder:3. ESP-NOW - Prueba_Servo_Sensor}", "-e", "receptor_esp32", "-t", "upload"],
+        "problemMatcher": []
+      },
+      {
+        "label": "ESP-NOW: monitor receptor (ESP32, COM3)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        // DTR/RTS en 0: si no, el ESP32 queda trabado en modo grabacion
+        "args": ["device", "monitor", "-d", "${workspaceFolder:3. ESP-NOW - Receptor_ESP32}", "--dtr", "0", "--rts", "0"],
+        "isBackground": true,
+        "problemMatcher": [],
+        "presentation": { "group": "espnow", "panel": "dedicated", "reveal": "always", "focus": false }
+      },
+      {
+        "label": "ESP-NOW: monitor transmisor (C3, COM5)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["device", "monitor", "-d", "${workspaceFolder:3. ESP-NOW - Transmisor_C3}"],
+        "isBackground": true,
+        "problemMatcher": [],
+        "presentation": { "group": "espnow", "panel": "dedicated", "reveal": "always", "focus": true }
+      },
+      {
+        "label": "ESP-NOW: monitor transmisor + receptor",
+        "dependsOn": ["ESP-NOW: monitor receptor (ESP32, COM3)", "ESP-NOW: monitor transmisor (C3, COM5)"],
+        "dependsOrder": "parallel",
+        "problemMatcher": []
+      }
+    ]
   }
 }

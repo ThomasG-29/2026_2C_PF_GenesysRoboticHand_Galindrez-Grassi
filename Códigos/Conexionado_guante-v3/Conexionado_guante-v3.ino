@@ -2,7 +2,7 @@
 #include <Adafruit_ADS1X15.h>
 
 // =====================================================
-// ESP32-S3 MINI
+// ESP32-C3 MINI
 // =====================================================
 
 #define SDA_PIN 8
@@ -113,6 +113,37 @@ return ads.readADC_SingleEnded(ADS_CHANNEL_MUX2);
 }
 
 // =====================================================
+// TABLA EN PANTALLA: encabezado fijo arriba de la terminal
+// y debajo los valores, que se actualizan en el lugar.
+// Usa codigos ANSI (requiere monitor_filters = direct).
+// =====================================================
+
+#define ESC "\x1B"
+
+void dibujarTabla(const int16_t valores[17])
+{
+char linea[128];
+int pos = 0;
+for (int i = 0; i < 17; i++)
+{
+if (i == 7) pos += snprintf(linea + pos, sizeof(linea) - pos, " |");
+pos += snprintf(linea + pos, sizeof(linea) - pos, "%6d", valores[i]);
+}
+
+// Todo en un solo envio para que no parpadee:
+// cursor al inicio + encabezado + valores + borrar lo que quede abajo
+char pantalla[400];
+snprintf(pantalla, sizeof(pantalla),
+         ESC "[H"
+         "    F1    F2    F3    F4    F5    F6    F7 |    P1    P2    P3    P4    P5    P6    P7    P8    P9   P10" ESC "[K\r\n"
+         "-------------------------------------------+------------------------------------------------------------" ESC "[K\r\n"
+         "%s" ESC "[K\r\n"
+         ESC "[J",
+         linea);
+Serial.print(pantalla);
+}
+
+// =====================================================
 // SETUP
 // =====================================================
 
@@ -123,7 +154,7 @@ delay(1000);
 
 Serial.println();
 Serial.println("=================================");
-Serial.println("  ESP32-S3 - 7 FLEX + 10 POT + 2 MUX (sin servo)");
+Serial.println("  ESP32-C3 - 7 FLEX + 10 POT + 2 MUX (sin servo)");
 Serial.println("=================================");
 
 Wire.begin(SDA_PIN, SCL_PIN);
@@ -146,7 +177,8 @@ selectMuxChannel(FLEX1_CHANNEL_MUX2);
 Serial.println("CD74HC4067 (x2) configurados.");
 
 Serial.println("Sistema listo.");
-Serial.println();
+delay(1000);
+Serial.print(ESC "[2J");  // limpiar la pantalla una vez antes de la tabla
 }
 
 // =====================================================
@@ -196,56 +228,16 @@ int16_t pot10 = leerPotenciometro2(POT10_CHANNEL);
 // SERIAL
 // ===================================================
 
-Serial.print("Flex 1: ");
-Serial.print(flex1);
+int16_t valores[17] = {flex1, flex2, flex3, flex4, flex5, flex6, flex7,
+                       pot1, pot2, pot3, pot4, pot5, pot6, pot7, pot8, pot9, pot10};
 
-Serial.print("    Flex 2: ");
-Serial.print(flex2);
-
-Serial.print("    Flex 3: ");
-Serial.print(flex3);
-
-Serial.print("    Flex 4: ");
-Serial.print(flex4);
-
-Serial.print("    Flex 5: ");
-Serial.print(flex5);
-
-Serial.print("    Flex 6: ");
-Serial.print(flex6);
-
-Serial.print("    Flex 7: ");
-Serial.print(flex7);
-
-Serial.print("    Pot 1: ");
-Serial.print(pot1);
-
-Serial.print("    Pot 2: ");
-Serial.print(pot2);
-
-Serial.print("    Pot 3: ");
-Serial.print(pot3);
-
-Serial.print("    Pot 4: ");
-Serial.print(pot4);
-
-Serial.print("    Pot 5: ");
-Serial.print(pot5);
-
-Serial.print("    Pot 6: ");
-Serial.print(pot6);
-
-Serial.print("    Pot 7: ");
-Serial.print(pot7);
-
-Serial.print("    Pot 8: ");
-Serial.print(pot8);
-
-Serial.print("    Pot 9: ");
-Serial.print(pot9);
-
-Serial.print("    Pot 10: ");
-Serial.println(pot10);
+// Redibujar 10 veces por segundo (mas rapido no se llega a leer)
+static uint32_t ultimoDibujo = 0;
+if (millis() - ultimoDibujo >= 100)
+{
+ultimoDibujo = millis();
+dibujarTabla(valores);
+}
 
 delay(20);
 }
