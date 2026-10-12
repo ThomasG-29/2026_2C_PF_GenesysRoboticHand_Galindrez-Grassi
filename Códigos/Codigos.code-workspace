@@ -1,0 +1,19 @@
+{
+  "folders": [
+    // Carpeta principal: todos los códigos del proyecto
+    { "name": "Códigos", "path": "." },
+    // Accesos para compilar/grabar con PlatformIO (son las mismas carpetas
+    // que están dentro de Códigos/Prueba_ESPNOW; PlatformIO las necesita
+    // como carpetas separadas para mostrar sus botones)
+    { "name": "PlatformIO: Transmisor_C3", "path": "Prueba_ESPNOW/Transmisor_C3" },
+    { "name": "PlatformIO: Receptor_ESP32", "path": "Prueba_ESPNOW/Receptor_ESP32" }
+  ],
+  "settings": {
+    // El repositorio de Git está en la carpeta raíz del proyecto
+    "git.openRepositoryInParentFolders": "always",
+    // Revisa cada tanto si hay cambios nuevos en GitHub
+    "git.autofetch": true,
+    // Oculta las carpetas de compilación de PlatformIO
+    "files.exclude": { "**/.pio": true }
+  }
+}
