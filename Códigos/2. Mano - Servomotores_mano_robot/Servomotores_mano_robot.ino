@@ -76,13 +76,25 @@ void setup() {
 
   delay(10);
 
-  // Posiciona todos los servos en 0° al iniciar
-  moverGrupo(CANALES_MG92B, CANT_MG92B, 0, MG92B_MIN_US, MG92B_MAX_US);
-  moverGrupo(CANALES_MG90S, CANT_MG90S, 0, MG90S_MIN_US, MG90S_MAX_US);
-  moverGrupo(CANALES_DS3225, CANT_DS3225, 0, DS3225_MIN_US, DS3225_MAX_US);
+  // Cero: lleva los servos a 0° de a uno, para no pedirle a la fuente
+  // el pico de corriente de los 16 arrancando juntos
+  Serial.println("Llevando servos a 0°...");
+  for (int i = 0; i < CANT_MG92B; i++) {
+    moverServo(CANALES_MG92B[i], 0, MG92B_MIN_US, MG92B_MAX_US);
+    delay(150);
+  }
+  for (int i = 0; i < CANT_MG90S; i++) {
+    moverServo(CANALES_MG90S[i], 0, MG90S_MIN_US, MG90S_MAX_US);
+    delay(150);
+  }
+  for (int i = 0; i < CANT_DS3225; i++) {
+    moverServo(CANALES_DS3225[i], 0, DS3225_MIN_US, DS3225_MAX_US);
+    delay(150);
+  }
 
-  Serial.println("16 servos posicionados en 0°. Iniciando prueba...");
-  delay(1000);
+  // Se quedan quietos en 0° antes de arrancar la secuencia
+  Serial.println("16 servos en 0°. La secuencia arranca en 3 s...");
+  delay(3000);
 }
 
 // =====================================================

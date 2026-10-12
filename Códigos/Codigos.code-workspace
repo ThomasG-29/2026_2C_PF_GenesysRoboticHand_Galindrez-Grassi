@@ -21,7 +21,10 @@
     { "name": "4. Arduino - prueba_5_sensores_flex", "path": "4. Arduino - prueba_5_sensores_flex" },
     { "name": "4. Arduino - prueba_potenciometro_servo", "path": "4. Arduino - prueba_potenciometro_servo" },
     { "name": "4. Arduino - prueba_sensores_flex", "path": "4. Arduino - prueba_sensores_flex" },
-    { "name": "4. Arduino - Sensor_flex", "path": "4. Arduino - Sensor_flex" }
+    { "name": "4. Arduino - Sensor_flex", "path": "4. Arduino - Sensor_flex" },
+    // Version definitiva: guante (C3) -> ESP-NOW -> mano (ESP32 + PCA9685)
+    { "name": "5. Guante - ESP32-C3(Transmisor)", "path": "5. Guante - ESP32-C3(Transmisor)" },
+    { "name": "5. Mano - ESP32(Receptor)", "path": "5. Mano - ESP32(Receptor)" }
   ],
   "settings": {
     // El repositorio de Git está en la carpeta raíz del proyecto
@@ -38,6 +41,44 @@
   "tasks": {
     "version": "2.0.0",
     "tasks": [
+      {
+        "label": "Mano: monitor receptor (ESP32, COM3)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["device", "monitor", "-d", "${workspaceFolder:5. Mano - ESP32(Receptor)}"],
+        "isBackground": true,
+        "problemMatcher": [],
+        "presentation": { "group": "mano", "panel": "dedicated", "reveal": "always", "focus": true }
+      },
+      {
+        "label": "Mano: monitor transmisor (C3, COM5)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["device", "monitor", "-d", "${workspaceFolder:5. Guante - ESP32-C3(Transmisor)}"],
+        "isBackground": true,
+        "problemMatcher": [],
+        "presentation": { "group": "mano", "panel": "dedicated", "reveal": "always", "focus": false }
+      },
+      {
+        "label": "Mano: monitor transmisor + receptor",
+        "dependsOn": ["Mano: monitor transmisor (C3, COM5)", "Mano: monitor receptor (ESP32, COM3)"],
+        "dependsOrder": "parallel",
+        "problemMatcher": []
+      },
+      {
+        "label": "Mano: subir transmisor (C3)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["run", "-d", "${workspaceFolder:5. Guante - ESP32-C3(Transmisor)}", "-t", "upload"],
+        "problemMatcher": []
+      },
+      {
+        "label": "Mano: subir receptor (ESP32)",
+        "type": "process",
+        "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
+        "args": ["run", "-d", "${workspaceFolder:5. Mano - ESP32(Receptor)}", "-t", "upload"],
+        "problemMatcher": []
+      },
       {
         "label": "Servo-Sensor: monitor receptor (ESP32, COM3)",
         "type": "process",
