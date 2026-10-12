@@ -1,9 +1,9 @@
-Modelos CAD/Descargados/Motores/MG90 Microservo/mg90s-micro-servo-motor-high-detail-cad-model-internal-gears-motor-included-1.snapshot.4.zip
-Modelos CAD/Descargados/Motores/MG90 Microservo/ServoMotorMG90S/Assembly Micro Servo MG90S.step
-Modelos CAD/Descargados/Motores/MG90 Microservo/ServoMotorMG90S/Assembly Micro Servo MG90S/Assembly Micro Servo MG90S/Assem.ipt
-Modelos CAD/Descargados/Motores/MG90 Microservo/ServoMotorMG90S/Buttom Part.step
-Modelos CAD/Descargados/Motores/MG90 Microservo/ServoMotorMG90S/Gear A.step
-Modelos CAD/Descargados/Motores/MG90 Microservo/ServoMotorMG90S/Gear B.step
-Modelos CAD/Descargados/Motores/MG90 Microservo/ServoMotorMG90S/Gear C.step
-Modelos CAD/Descargados/Motores/MG90 Microservo/ServoMotorMG90S/Main Screw.step
-Modelos CAD/Descargados/Motores/MG90 Microservo/ServoMotorMG90S/Main Shaft with Gear.step
+# Solo se sincroniza con GitHub la carpeta Códigos.
+# CAD, documentación y conexionados quedan en OneDrive.
+# (Los archivos de esas carpetas que ya estaban en GitHub siguen ahí.)
+/*
+!/Códigos/
+!/.gitignore
+!/.gitattributes
+
+desktop.ini

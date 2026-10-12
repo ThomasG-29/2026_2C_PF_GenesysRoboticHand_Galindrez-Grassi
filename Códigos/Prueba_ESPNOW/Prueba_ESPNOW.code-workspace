@@ -3,5 +3,10 @@
     { "path": "Transmisor_C3" },
     { "path": "Receptor_ESP32" }
   ],
-  "settings": {}
+  "settings": {
+    // El repositorio de Git esta en la carpeta raiz del proyecto
+    "git.openRepositoryInParentFolders": "always",
+    // Revisa cada tanto si hay cambios nuevos en GitHub
+    "git.autofetch": true
+  }
 }
