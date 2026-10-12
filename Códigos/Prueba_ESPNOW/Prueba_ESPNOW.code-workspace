@@ -1,7 +1,8 @@
 {
   "folders": [
     { "path": "Transmisor_C3" },
-    { "path": "Receptor_ESP32" }
+    { "path": "Receptor_ESP32" },
+    { "name": "Códigos (todos)", "path": ".." }
   ],
   "settings": {
     // El repositorio de Git esta en la carpeta raiz del proyecto
