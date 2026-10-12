@@ -1,0 +1,7 @@
+{
+  "folders": [
+    { "path": "Transmisor_C3" },
+    { "path": "Receptor_ESP32" }
+  ],
+  "settings": {}
+}
