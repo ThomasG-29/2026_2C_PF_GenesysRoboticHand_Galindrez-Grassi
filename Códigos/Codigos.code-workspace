@@ -5,23 +5,23 @@
   // Al crear un proyecto nuevo, agregarlo acá.
   "folders": [
     // Guante (ESP32-S3 Mini)
-    { "name": "1. Guante v1", "path": "Conexionado_guante-v1" },
-    { "name": "1. Guante v2", "path": "Conexionado_guante-v2" },
-    { "name": "1. Guante v3", "path": "Conexionado_guante-v3" },
+    { "name": "1. Guante v1", "path": "1. Guante v1" },
+    { "name": "1. Guante v2", "path": "1. Guante v2" },
+    { "name": "1. Guante v3", "path": "1. Guante v3" },
     // Mano robot (ESP32 + PCA9685)
-    { "name": "2. Mano - Servomotores_mano_robot", "path": "Servomotores_mano_robot" },
-    { "name": "2. Mano - Servos_esp32_PCA", "path": "Servos_esp32_PCA" },
+    { "name": "2. Mano - Servomotores_mano_robot", "path": "2. Mano - Servomotores_mano_robot" },
+    { "name": "2. Mano - Servos_esp32_PCA", "path": "2. Mano - Servos_esp32_PCA" },
     // Comunicación ESP-NOW guante -> mano
-    { "name": "3. ESP-NOW - Transmisor_C3", "path": "Prueba_ESPNOW/Transmisor_C3" },
-    { "name": "3. ESP-NOW - Receptor_ESP32", "path": "Prueba_ESPNOW/Receptor_ESP32" },
+    { "name": "3. ESP-NOW - Transmisor_C3", "path": "3. ESP-NOW - Transmisor_C3" },
+    { "name": "3. ESP-NOW - Receptor_ESP32", "path": "3. ESP-NOW - Receptor_ESP32" },
     // Flex 1 del guante (C3) -> servo de la mano (ESP32): un proyecto, dos entornos
-    { "name": "3. ESP-NOW - Prueba_Servo_Sensor", "path": "Prueba_Servo_Sensor" },
+    { "name": "3. ESP-NOW - Prueba_Servo_Sensor", "path": "3. ESP-NOW - Prueba_Servo_Sensor" },
     // Pruebas iniciales con Arduino Uno
-    { "name": "4. Arduino - Pruebas_funcionales_flex_servos", "path": "Pruebas_funcionales_flex_servos_arduino" },
-    { "name": "4. Arduino - prueba_5_sensores_flex", "path": "prueba_5_sensores_flex_arduino" },
-    { "name": "4. Arduino - prueba_potenciometro_servo", "path": "prueba_potenciometro_servo_arduino" },
-    { "name": "4. Arduino - prueba_sensores_flex", "path": "prueba_sensores_flex" },
-    { "name": "4. Arduino - Sensor_flex", "path": "Sensor_flex" }
+    { "name": "4. Arduino - Pruebas_funcionales_flex_servos", "path": "4. Arduino - Pruebas_funcionales_flex_servos" },
+    { "name": "4. Arduino - prueba_5_sensores_flex", "path": "4. Arduino - prueba_5_sensores_flex" },
+    { "name": "4. Arduino - prueba_potenciometro_servo", "path": "4. Arduino - prueba_potenciometro_servo" },
+    { "name": "4. Arduino - prueba_sensores_flex", "path": "4. Arduino - prueba_sensores_flex" },
+    { "name": "4. Arduino - Sensor_flex", "path": "4. Arduino - Sensor_flex" }
   ],
   "settings": {
     // El repositorio de Git está en la carpeta raíz del proyecto
