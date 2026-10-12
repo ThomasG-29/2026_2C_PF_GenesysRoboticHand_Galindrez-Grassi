@@ -469,6 +469,14 @@ void loop() {
     sinSenalAvisado = true;
   }
 
+  // Nunca llego un paquete: avisar cada 3 s (si no, el receptor queda en silencio)
+  static uint32_t ultimoAvisoEspera = millis();
+  if (!hayDatos && !largoDistinto && millis() - ultimoAvisoEspera > 3000) {
+    ultimoAvisoEspera = millis();
+    Serial.println(">>> ESPERANDO AL GUANTE: no llego ningun paquete. Revisar que la C3 este encendida "
+                   "y tenga grabado \"5. Guante - ESP32-C3(Transmisor)\" (y no otra prueba)");
+  }
+
   static uint32_t ultimoAvisoLargo = 0;
   if (largoDistinto && millis() - ultimoAvisoLargo > 5000) {
     ultimoAvisoLargo = millis();

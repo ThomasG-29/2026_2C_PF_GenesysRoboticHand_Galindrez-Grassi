@@ -80,6 +80,13 @@
         "problemMatcher": []
       },
       {
+        // Antes de probar la mano: graba los dos (la C3 se usa en otras pruebas)
+        "label": "Mano: subir transmisor + receptor",
+        "dependsOn": ["Mano: subir transmisor (C3)", "Mano: subir receptor (ESP32)"],
+        "dependsOrder": "sequence",
+        "problemMatcher": []
+      },
+      {
         "label": "Servo-Sensor: monitor receptor (ESP32, COM3)",
         "type": "process",
         "command": "${userHome}/.platformio/penv/Scripts/pio.exe",
