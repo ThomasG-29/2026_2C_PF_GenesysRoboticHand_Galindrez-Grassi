@@ -8,6 +8,11 @@
 //   Flex 1      -> multiplexor 2, canal 0     -> A1 del ADS1115
 //   Flex 2 al 7 -> multiplexor 1, canales 1-6 -> A0 del ADS1115
 // (Los 10 potenciometros se agregan mas adelante.)
+//
+// Flex 7 (costado de la muneca) es bidireccional: al doblarlo hacia un
+// lado SUBE su resistencia y hacia el otro BAJA. Aca no se limita nada,
+// se manda la resistencia tal cual y el receptor decide hacia que lado
+// mover el servo.
 // =====================================================
 #include <Arduino.h>
 #include <WiFi.h>

@@ -7,18 +7,29 @@
 //   Flex 6 y 7  -> DS3225 S11 y S12 (canales 10 y 11 del PCA9685)
 //   (segun Conexionados/Circuito_mano_robot)
 //
+// Flex 7 (costado de la muneca) es BIDIRECCIONAL: muneca derecha = centro
+// (servo a 90), doblada hacia un lado sube la resistencia (servo hacia
+// anguloDoblado) y doblada hacia el otro baja (servo hacia anguloOtroLado).
+// Si el servo gira al reves, intercambiar esos dos angulos (a7 90 10 170).
+//
 // La calibracion de los flex se guarda en la memoria del ESP32
 // (no se pierde al apagar). Al arrancar, el estirado se vuelve a medir
-// con los primeros paquetes: arrancar con la mano del guante ESTIRADA.
+// con los primeros paquetes: arrancar con la mano del guante ESTIRADA
+// y la muneca DERECHA (centro).
 //
 // Comandos por el monitor serie (escribir y Enter):
-//   c      : calibracion guiada (mano abierta 3 s, despues doblar todo 6 s)
+//   c      : calibracion guiada (mano abierta 3 s, despues doblar todo 6 s;
+//            en esos 6 s llevar la muneca a un costado y despues al otro)
 //   p / d  : tomar la resistencia actual de TODOS los flex como estirado / doblado
 //   p3, d3 : lo mismo pero solo para el flex 3 (1 a 7)
+//   o7     : tomar la resistencia actual del flex 7 como "otro lado"
+//            (solo flex bidireccionales)
 //   s      : mostrar la calibracion
-//   t3     : prueba del servo del flex 3 (barrido estirado -> doblado -> estirado)
+//   t3     : prueba del servo del flex 3 (barrido estirado -> doblado -> estirado;
+//            si es bidireccional sigue -> otro lado -> centro)
 //   a3 10 170 : angulos del servo 3 (estirado, doblado). Es temporal, para
 //               probar: los definitivos se escriben en SERVOS[] mas abajo.
+//   a7 90 170 10 : angulos del servo 7 (centro, un lado, otro lado)
 //   r      : reiniciar contadores de paquetes
 // =====================================================
 #include <Arduino.h>
@@ -44,20 +55,26 @@ typedef struct {
   uint8_t  canal;           // salida del PCA9685
   uint16_t minUs, maxUs;    // pulso para 0 y 180 grados
   // Sin llegar a 0/180: en los extremos el servo choca con su tope y vibra
-  uint8_t  anguloPlano;     // angulo con el dedo estirado
-  uint8_t  anguloDoblado;   // angulo con el dedo doblado
+  uint8_t  anguloPlano;     // angulo con el dedo estirado (centro si es bidireccional)
+  uint8_t  anguloDoblado;   // angulo con el dedo doblado (lado donde SUBE la resistencia)
+  uint8_t  anguloOtroLado;  // bidireccional: angulo doblado hacia el lado donde BAJA
+                            // la resistencia. SIN_OTRO_LADO = flex comun (un solo sentido)
 } ServoDedo;
+
+#define SIN_OTRO_LADO 255
 
 // Un servo por flex, en el mismo orden (SERVOS[0] lo mueve el flex 1)
 ServoDedo SERVOS[CANT_FLEX] = {
-  {"S1 MG90S",    0, MG90S_MIN_US,  MG90S_MAX_US,  10, 170},   // Flex 1
-  {"S2 MG90S",    1, MG90S_MIN_US,  MG90S_MAX_US,  10, 170},   // Flex 2
-  {"S3 MG90S",    2, MG90S_MIN_US,  MG90S_MAX_US,  10, 170},   // Flex 3
-  {"S4 MG90S",    3, MG90S_MIN_US,  MG90S_MAX_US,  10, 170},   // Flex 4
-  {"S5 MG90S",    4, MG90S_MIN_US,  MG90S_MAX_US,  10, 170},   // Flex 5
-  {"S11 DS3225", 10, DS3225_MIN_US, DS3225_MAX_US, 10, 170},   // Flex 6
-  {"S12 DS3225", 11, DS3225_MIN_US, DS3225_MAX_US, 10, 170},   // Flex 7
+  {"S1 MG90S",    0, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO},   // Flex 1
+  {"S2 MG90S",    1, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO},   // Flex 2
+  {"S3 MG90S",    2, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO},   // Flex 3
+  {"S4 MG90S",    3, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO},   // Flex 4
+  {"S5 MG90S",    4, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO},   // Flex 5
+  {"S11 DS3225", 10, DS3225_MIN_US, DS3225_MAX_US, 10, 170, SIN_OTRO_LADO},   // Flex 6
+  {"S12 DS3225", 11, DS3225_MIN_US, DS3225_MAX_US, 90, 170, 10},              // Flex 7 (muneca lateral)
 };
+
+bool esBidireccional(int i) { return SERVOS[i].anguloOtroLado != SIN_OTRO_LADO; }
 
 // Limitador de velocidad (igual que en la prueba): grados por paquete
 #define PASO_MAXIMO 6.0f
@@ -87,6 +104,12 @@ ServoDedo SERVOS[CANT_FLEX] = {
 #define RANGO_MINIMO   300     // ohms: si un flex cambia menos, no se calibra
 #define MARGEN_DOBLADO 0.05f   // el doblado queda un 5% antes del maximo medido
 
+// Flex bidireccional (muneca): hacia el lado donde BAJA la resistencia
+// el flex cambia bastante menos, por eso el rango y el minimo son menores
+#define RANGO_INICIAL_OTRO_LADO 500   // ohms por debajo del centro si nunca se calibro
+#define RANGO_MINIMO_OTRO_LADO  100   // ohms: si cambia menos, no se calibra ese lado
+#define ZONA_CENTRO 0.06f             // 6% del recorrido alrededor del centro = servo quieto en el centro
+
 #define TIMEOUT_SENAL_MS 500   // sin paquetes durante este tiempo -> SIN SENAL
 
 // =====================================================
@@ -101,6 +124,7 @@ typedef struct {
 } Recepcion;
 
 uint32_t rPlano[CANT_FLEX], rDoblado[CANT_FLEX];
+uint32_t rOtroLado[CANT_FLEX];   // solo flex bidireccionales: resistencia doblado hacia el otro lado
 bool calibracionGuardada = false;
 float rFiltrada[CANT_FLEX];
 float anguloServo[CANT_FLEX];
@@ -119,7 +143,7 @@ uint64_t calSuma[CANT_FLEX];
 // Calibracion guiada
 enum { CAL_NO, CAL_ABIERTA, CAL_CERRADA } calEstado = CAL_NO;
 uint32_t calInicio = 0, calUltimoAviso = 0;
-float calMax[CANT_FLEX];
+float calMax[CANT_FLEX], calMin[CANT_FLEX];
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
 void onRecibido(const esp_now_recv_info_t *info, const uint8_t *datos, int largo) {
@@ -152,29 +176,61 @@ void moverServoSuave(int i, float objetivo) {
   escribirServo(i, anguloServo[i]);
 }
 
+// Bidireccional: cerca del centro el servo queda quieto en el centro
+// (el ruido de la muneca derecha no lo hace cabecear de un lado al otro)
+float aplicarZonaCentro(float t) {
+  return t <= ZONA_CENTRO ? 0.0f : (t - ZONA_CENTRO) / (1.0f - ZONA_CENTRO);
+}
+
 // Resistencia -> angulo, segun la calibracion (funciona en cualquier sentido)
 float calcularAngulo(int i, float r) {
   const ServoDedo &s = SERVOS[i];
   if (rPlano[i] == rDoblado[i]) return s.anguloPlano;
   float t = (r - (float)rPlano[i]) / ((float)rDoblado[i] - (float)rPlano[i]);
+
+  if (esBidireccional(i)) {
+    if (t < 0) {
+      // Doblado hacia el otro lado (la resistencia va al reves que en el doblado)
+      if (rOtroLado[i] == rPlano[i]) return s.anguloPlano;
+      t = (r - (float)rPlano[i]) / ((float)rOtroLado[i] - (float)rPlano[i]);
+      t = aplicarZonaCentro(constrain(t, 0.0f, 1.0f));
+      return s.anguloPlano + t * (s.anguloOtroLado - s.anguloPlano);
+    }
+    t = aplicarZonaCentro(constrain(t, 0.0f, 1.0f));
+  }
+
   t = constrain(t, 0.0f, 1.0f);
   return s.anguloPlano + t * (s.anguloDoblado - s.anguloPlano);
 }
 
-// Barrido lento de un servo (prueba de conexion y de recorrido)
-void probarServo(int i) {
-  const ServoDedo &s = SERVOS[i];
-  Serial.printf(">>> Prueba %s (flex %d, canal %d): %d -> %d -> %d grados\n",
-                s.nombre, i + 1, s.canal, s.anguloPlano, s.anguloDoblado, s.anguloPlano);
-  int paso = s.anguloDoblado > s.anguloPlano ? 2 : -2;
-  for (int a = s.anguloPlano; (a - s.anguloDoblado) * paso <= 0; a += paso) {
+// Barrido lento de un servo entre dos angulos
+void barrerServo(int i, int desde, int hasta) {
+  int paso = hasta > desde ? 2 : -2;
+  for (int a = desde; (a - hasta) * paso <= 0; a += paso) {
     escribirServo(i, a);
     delay(25);
   }
+  escribirServo(i, hasta);
+}
+
+// Prueba de conexion y de recorrido de un servo
+void probarServo(int i) {
+  const ServoDedo &s = SERVOS[i];
+  if (esBidireccional(i))
+    Serial.printf(">>> Prueba %s (flex %d, canal %d): %d -> %d -> %d -> %d -> %d grados\n",
+                  s.nombre, i + 1, s.canal, s.anguloPlano, s.anguloDoblado, s.anguloPlano,
+                  s.anguloOtroLado, s.anguloPlano);
+  else
+    Serial.printf(">>> Prueba %s (flex %d, canal %d): %d -> %d -> %d grados\n",
+                  s.nombre, i + 1, s.canal, s.anguloPlano, s.anguloDoblado, s.anguloPlano);
+  barrerServo(i, s.anguloPlano, s.anguloDoblado);
   delay(400);
-  for (int a = s.anguloDoblado; (a - s.anguloPlano) * paso >= 0; a -= paso) {
-    escribirServo(i, a);
-    delay(25);
+  barrerServo(i, s.anguloDoblado, s.anguloPlano);
+  if (esBidireccional(i)) {
+    delay(400);
+    barrerServo(i, s.anguloPlano, s.anguloOtroLado);
+    delay(400);
+    barrerServo(i, s.anguloOtroLado, s.anguloPlano);
   }
   anguloServo[i] = s.anguloPlano;
   escribirServo(i, anguloServo[i]);
@@ -189,13 +245,25 @@ void probarServo(int i) {
 void guardarCalibracion() {
   memoria.putBytes("rPlano", rPlano, sizeof(rPlano));
   memoria.putBytes("rDoblado", rDoblado, sizeof(rDoblado));
+  memoria.putBytes("rOtroLado", rOtroLado, sizeof(rOtroLado));
   calibracionGuardada = true;
+}
+
+// "Otro lado" por defecto: un poco por debajo del centro
+uint32_t otroLadoInicial(uint32_t plano) {
+  return plano > 2 * RANGO_INICIAL_OTRO_LADO ? plano - RANGO_INICIAL_OTRO_LADO : plano / 2;
+}
+
+// El otro lado tiene que quedar por debajo del centro (el doblado queda por encima)
+bool otroLadoValido(int i) {
+  return rOtroLado[i] + RANGO_MINIMO_OTRO_LADO <= rPlano[i];
 }
 
 void cargarCalibracion() {
   for (int i = 0; i < CANT_FLEX; i++) {
     rPlano[i] = R_PLANO_INICIAL;
     rDoblado[i] = R_PLANO_INICIAL + RANGO_INICIAL;
+    rOtroLado[i] = otroLadoInicial(R_PLANO_INICIAL);
   }
   bool ok = memoria.isKey("rPlano") && memoria.isKey("rDoblado") &&
             memoria.getBytesLength("rPlano") == sizeof(rPlano) &&
@@ -204,17 +272,25 @@ void cargarCalibracion() {
   if (ok) {
     memoria.getBytes("rPlano", rPlano, sizeof(rPlano));
     memoria.getBytes("rDoblado", rDoblado, sizeof(rDoblado));
+    // Calibraciones viejas no tienen el otro lado: se usa el valor por defecto
+    if (memoria.isKey("rOtroLado") && memoria.getBytesLength("rOtroLado") == sizeof(rOtroLado))
+      memoria.getBytes("rOtroLado", rOtroLado, sizeof(rOtroLado));
+    for (int i = 0; i < CANT_FLEX; i++)
+      if (!otroLadoValido(i)) rOtroLado[i] = otroLadoInicial(rPlano[i]);
   }
   Serial.println(ok ? "Calibracion cargada de la memoria." : "Sin calibracion guardada: valores por defecto.");
 }
 
 void imprimirCalibracion() {
-  Serial.println(">>> Calibracion:  flex  servo        canal   estirado (ohm -> gr)   doblado (ohm -> gr)");
+  Serial.println(">>> Calibracion:  flex  servo        canal   estirado (ohm -> gr)   doblado (ohm -> gr)   otro lado (ohm -> gr)");
   for (int i = 0; i < CANT_FLEX; i++) {
     const ServoDedo &s = SERVOS[i];
-    Serial.printf(">>>                 %d   %-11s   %2d    %6lu -> %3d         %6lu -> %3d\n",
+    Serial.printf(">>>                 %d   %-11s   %2d    %6lu -> %3d         %6lu -> %3d",
                   i + 1, s.nombre, s.canal, (unsigned long)rPlano[i], s.anguloPlano,
                   (unsigned long)rDoblado[i], s.anguloDoblado);
+    if (esBidireccional(i))
+      Serial.printf("          %6lu -> %3d", (unsigned long)rOtroLado[i], s.anguloOtroLado);
+    Serial.println();
   }
 }
 
@@ -236,10 +312,23 @@ void terminarCalibracionInicio() {
                     i + 1, (unsigned long)medido);
       continue;
     }
+    // Bidireccional: tambien puede estar doblado hacia el otro lado
+    int32_t rangoOtro = (int32_t)rPlano[i] - (int32_t)rOtroLado[i];
+    if (esBidireccional(i) && calibracionGuardada &&
+        (int32_t)rPlano[i] - (int32_t)medido > rangoOtro / 2) {
+      Serial.printf(">>> Flex %d parece doblado hacia el otro lado al arrancar (%lu ohm): se deja el centro guardado\n",
+                    i + 1, (unsigned long)medido);
+      continue;
+    }
+    // El otro lado se mueve junto con el centro (mantiene su rango)
+    if (esBidireccional(i) && calibracionGuardada && otroLadoValido(i) && (int32_t)medido > rangoOtro)
+      rOtroLado[i] = medido - rangoOtro;
     rPlano[i] = medido;
     // Sin un doblado valido (nunca se calibro): estirado + rango tipico
     if (!calibracionGuardada || rDoblado[i] < rPlano[i] + RANGO_MINIMO)
       rDoblado[i] = rPlano[i] + RANGO_INICIAL;
+    if (!calibracionGuardada || !otroLadoValido(i))
+      rOtroLado[i] = otroLadoInicial(rPlano[i]);
   }
   calibrandoInicio = false;
   imprimirCalibracion();
@@ -252,17 +341,18 @@ void iniciarCalibracionGuiada() {
   calInicio = calUltimoAviso = millis();
   calCant = 0;
   for (int i = 0; i < CANT_FLEX; i++) calSuma[i] = 0;
-  Serial.println("\n>>> CALIBRACION 1/2: ABRIR la mano (todos los dedos estirados) y dejarla quieta 3 s...");
+  Serial.println("\n>>> CALIBRACION 1/2: ABRIR la mano (todos los dedos estirados, muneca DERECHA) y dejarla quieta 3 s...");
 }
 
 void avanzarCalibracionGuiada() {
   uint32_t ahora = millis();
   if (calEstado == CAL_ABIERTA && ahora - calInicio >= CAL_ABIERTA_MS) {
     if (calCant == 0) { Serial.println(">>> Sin datos: calibracion cancelada"); calEstado = CAL_NO; return; }
-    for (int i = 0; i < CANT_FLEX; i++) calMax[i] = calSuma[i] / calCant;
+    for (int i = 0; i < CANT_FLEX; i++) calMax[i] = calMin[i] = calSuma[i] / calCant;
     calEstado = CAL_CERRADA;
     calInicio = calUltimoAviso = ahora;
     Serial.println(">>> CALIBRACION 2/2: DOBLAR AL MAXIMO todos los flex (cerrar la mano, etc.) durante 6 s...");
+    Serial.println(">>>                  MUNECA: llevarla al maximo hacia un costado y despues hacia el otro");
   } else if (calEstado == CAL_CERRADA && ahora - calInicio >= CAL_CERRADA_MS) {
     calEstado = CAL_NO;
     for (int i = 0; i < CANT_FLEX; i++) {
@@ -272,8 +362,19 @@ void avanzarCalibracionGuiada() {
         Serial.printf(">>> Flex %d casi no cambio (%.0f ohm): se deja la calibracion anterior\n", i + 1, rango);
         continue;
       }
+      // Bidireccional: el otro lado es el minimo medido (si el centro se mueve,
+      // un otro lado viejo puede quedar mal, por eso se revisa despues)
+      if (esBidireccional(i)) {
+        float rangoOtro = plano - calMin[i];
+        if (rangoOtro >= RANGO_MINIMO_OTRO_LADO)
+          rOtroLado[i] = (uint32_t)(calMin[i] + MARGEN_DOBLADO * rangoOtro);
+        else
+          Serial.printf(">>> Flex %d casi no cambio hacia el otro lado (%.0f ohm): se deja el anterior\n",
+                        i + 1, rangoOtro);
+      }
       rPlano[i] = plano;
       rDoblado[i] = (uint32_t)(calMax[i] - MARGEN_DOBLADO * rango);
+      if (esBidireccional(i) && !otroLadoValido(i)) rOtroLado[i] = otroLadoInicial(rPlano[i]);
     }
     guardarCalibracion();
     Serial.println(">>> Calibracion terminada y guardada.");
@@ -327,7 +428,10 @@ void procesar(const Recepcion &r) {
     for (int i = 0; i < CANT_FLEX; i++) calSuma[i] += p.resistencia[i];
     calCant++;
   } else if (calEstado == CAL_CERRADA) {
-    for (int i = 0; i < CANT_FLEX; i++) calMax[i] = max(calMax[i], rFiltrada[i]);
+    for (int i = 0; i < CANT_FLEX; i++) {
+      calMax[i] = max(calMax[i], rFiltrada[i]);
+      calMin[i] = min(calMin[i], rFiltrada[i]);
+    }
   }
 
   for (int i = 0; i < CANT_FLEX; i++) moverServoSuave(i, calcularAngulo(i, rFiltrada[i]));
@@ -353,7 +457,24 @@ void ejecutarComando(char *linea) {
 
   if (c == 'p' || c == 'd') {
     if (!hayDatos) { Serial.println(">>> Sin datos del guante"); return; }
-    for (int i = desde; i < hasta; i++) (c == 'p' ? rPlano : rDoblado)[i] = (uint32_t)rFiltrada[i];
+    for (int i = desde; i < hasta; i++) {
+      (c == 'p' ? rPlano : rDoblado)[i] = (uint32_t)rFiltrada[i];
+      if (esBidireccional(i) && !otroLadoValido(i)) rOtroLado[i] = otroLadoInicial(rPlano[i]);
+    }
+    guardarCalibracion();
+    imprimirCalibracion();
+  } else if (c == 'o') {
+    if (!hayDatos) { Serial.println(">>> Sin datos del guante"); return; }
+    for (int i = desde; i < hasta; i++) {
+      if (!esBidireccional(i)) {
+        if (n) Serial.printf(">>> Flex %d no es bidireccional\n", i + 1);
+        continue;
+      }
+      rOtroLado[i] = (uint32_t)rFiltrada[i];
+      if (!otroLadoValido(i))
+        Serial.printf(">>> Flex %d: el otro lado tiene que quedar al menos %d ohm por debajo del centro (%lu)\n",
+                      i + 1, RANGO_MINIMO_OTRO_LADO, (unsigned long)rPlano[i]);
+    }
     guardarCalibracion();
     imprimirCalibracion();
   } else if (c == 'c') {
@@ -365,13 +486,16 @@ void ejecutarComando(char *linea) {
   } else if (c == 't' && n) {
     probarServo(n - 1);
   } else if (c == 'a' && n) {
-    int plano, doblado;
-    if (sscanf(linea + 1, "%*d %d %d", &plano, &doblado) == 2) {
+    int plano, doblado, otro;
+    int leidos = sscanf(linea + 1, "%*d %d %d %d", &plano, &doblado, &otro);
+    if (leidos >= 2) {
       SERVOS[n - 1].anguloPlano = constrain(plano, 0, 180);
       SERVOS[n - 1].anguloDoblado = constrain(doblado, 0, 180);
+      if (leidos == 3 && esBidireccional(n - 1)) SERVOS[n - 1].anguloOtroLado = constrain(otro, 0, 180);
       imprimirCalibracion();
     } else {
       Serial.println(">>> Uso: a3 10 170  (servo 3: estirado 10 gr, doblado 170 gr)");
+      Serial.println(">>>      a7 90 170 10  (muneca: centro 90, un lado 170, otro lado 10)");
     }
   } else if (c == 'r') {
     recibidos = perdidos = largoDistinto = 0;
@@ -436,6 +560,7 @@ void setup() {
 
   Serial.printf("Mi MAC: %s  Canal: %d\n", WiFi.macAddress().c_str(), CANAL_ESPNOW);
   Serial.println("Comandos: c = calibracion guiada | p/d = estirado/doblado actual (p3 = solo flex 3)");
+  Serial.println("          o7 = otro lado actual de la muneca | a7 90 170 10 = angulos muneca");
   Serial.println("          s = ver calibracion | t3 = probar servo 3 | a3 10 170 = angulos servo 3 | r = contadores");
 
   cola = xQueueCreate(20, sizeof(Recepcion));
@@ -446,7 +571,7 @@ void setup() {
   esp_now_register_recv_cb(onRecibido);
 
   if (calibrandoInicio)
-    Serial.println("Calibrando: mantener la mano del guante ESTIRADA hasta que aparezca la calibracion...");
+    Serial.println("Calibrando: mantener la mano del guante ESTIRADA y la muneca DERECHA hasta que aparezca la calibracion...");
   else {
     imprimirCalibracion();
     imprimirEncabezado();
