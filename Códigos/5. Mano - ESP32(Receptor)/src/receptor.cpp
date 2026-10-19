@@ -39,7 +39,12 @@
 //               probar: los definitivos se escriben en SERVOS[] mas abajo.
 //   a7 90 170 10 : angulos del servo 7 (centro, un lado, otro lado)
 //   h      : llevar la mano a HOME y dejarla quieta ahi (h otra vez: sigue al guante)
+//   v      : ver la tension de los servos; v 5.12 = corregirla con lo que marca el tester
 //   r      : reiniciar contadores de paquetes
+//
+// PROTECCION POR BAJA TENSION (ver mas abajo): mide V+ de los servos con un
+// divisor en GPIO34. Tension critica -> deja de seguir al guante y va a HOME;
+// tension de corte -> apaga los servos. Se rearma con h cuando se recupera.
 //
 // HOME: al encender la mano va a la posicion anguloHome de SERVOS[] y se queda
 // ahi hasta que el guante esta conectado y calibrado (ver HOME mas abajo).
@@ -109,6 +114,33 @@ bool esBidireccional(int i) { return SERVOS[i].anguloOtroLado != SIN_OTRO_LADO; 
 
 #define I2C_SDA 21
 #define I2C_SCL 22
+
+// =====================================================
+// PROTECCION POR BAJA TENSION DE LOS SERVOS
+// =====================================================
+// Se mide la tension V+ de los servos con el modulo "sensor de voltaje 0-25 V"
+// (divisor de 30k y 7.5k), conectado en paralelo, sin cortar nada:
+//   bornera VCC del modulo -> pin V+ de la tira de pines del PCA9685
+//   bornera GND del modulo -> GND
+//   pin S del modulo       -> GPIO34 (ADC1: el ADC2 no funciona con WiFi/ESP-NOW)
+// Con dos resistencias sueltas (10k de V+ a GPIO34 y 4.7k de GPIO34 a GND)
+// cambiar DIVISOR_TENSION por ((10000.0f + 4700.0f) / 4700.0f).
+//
+// Tensiones de los servos (hoja de datos): MG90S y MG92B 4.8 a 6.0 V,
+// DS3225 4.8 a 6.8 V. Por debajo de 4.8 V pierden fuerza; los DS3225 son
+// digitales y alrededor de 4.0-4.5 V su microcontrolador se puede reiniciar
+// y el servo salta a cualquier lado. El ESP32 tambien se alimenta de esta
+// fuente (VIN -> regulador 3.3 V, que necesita ~4.3 V en VIN).
+#define PIN_TENSION        34
+#define DIVISOR_TENSION    ((30000.0f + 7500.0f) / 7500.0f)   // modulo 0-25 V: divide por 5
+#define TENSION_AVISO      4.6f   // V: aviso por el monitor (todavia sigue al guante)
+#define TENSION_CRITICA    4.3f   // V: deja de seguir al guante y va a HOME (mano abierta: suelta el objeto)
+#define TENSION_CORTE      3.9f   // V: apaga los servos (quedan sueltos, sin fuerza) para que no salten
+#define TENSION_RECUPERADA 4.8f   // V: por encima de esto se puede rearmar con h
+#define TIEMPO_CRITICO_MS  150    // tiene que estar por debajo este tiempo seguido (los picos de
+                                  // un instante al arrancar un servo no cuentan)
+#define TIEMPO_RECUPERADA_MS 3000 // tiene que estar recuperada este tiempo seguido para rearmar
+#define TENSION_SIN_DIVISOR 2.0f  // V: si al encender se lee menos, el divisor no esta conectado
 
 // =====================================================
 // CALIBRACION DE LOS FLEX (ohms)
@@ -194,6 +226,14 @@ bool enHome = true;          // al encender arranca en HOME
 bool homeManual = false;     // comando h: se queda en HOME hasta otro h
 uint32_t tEnHome = 0;        // cuando llegaron todos los servos a HOME (0 = todavia no)
 
+// Proteccion por baja tension
+float tension = 0;              // V+ de los servos (filtrada)
+float factorTension = 1.0f;     // correccion por la tolerancia de las resistencias (comando v)
+bool divisorConectado = false;  // se decide al encender
+bool fallaTension = false;      // tension critica: en HOME hasta rearmar con h
+bool servosApagados = false;    // tension de corte: PWM apagado (servos sueltos)
+bool avisoTension = false;
+
 uint32_t recibidos = 0, perdidos = 0, ultimoSeq = 0, tUltimoRx = 0;
 volatile uint32_t largoDistinto = 0;
 bool sinSenalAvisado = false;
@@ -256,6 +296,7 @@ void onRecibido(const uint8_t *mac, const uint8_t *datos, int largo) {
 // SERVOS (PCA9685 a 50 Hz: 20000 us en 4096 pasos)
 // =====================================================
 void escribirServo(int i, float angulo) {
+  if (servosApagados) return;   // corte por baja tension: nada mueve los servos
   const ServoDedo &s = SERVOS[i];
   angulo = constrain(angulo, 0.0f, 180.0f);
   float us = s.minUs + angulo * (s.maxUs - s.minUs) / 180.0f;
@@ -297,10 +338,117 @@ void actualizarHome() {
   }
 
   // Sigue al guante solo si hay senal, ya se calibro el inicio y paso la espera
+  // (con falla de tension se queda en HOME hasta rearmar con h)
   bool guanteListo = hayDatos && !calibrandoInicio && !sinSenalAvisado;
-  if (!homeManual && guanteListo && ahora - tEnHome >= ESPERA_HOME_MS) {
+  if (!homeManual && !fallaTension && guanteListo && ahora - tEnHome >= ESPERA_HOME_MS) {
     enHome = false;
     Serial.println(">>> Siguiendo al guante");
+  }
+}
+
+// =====================================================
+// PROTECCION POR BAJA TENSION
+// =====================================================
+float leerTension() {
+  return analogReadMilliVolts(PIN_TENSION) / 1000.0f * DIVISOR_TENSION * factorTension;
+}
+
+void apagarServos() {
+  servosApagados = true;
+  for (int i = 0; i < CANT_FLEX; i++) pca.setPWM(SERVOS[i].canal, 0, 4096);   // sin pulso: servo suelto
+}
+
+// Vuelve a encender los servos llevandolos a HOME de a uno (no se sabe donde
+// quedaron mientras estuvieron sueltos)
+void encenderServosEnHome() {
+  servosApagados = false;
+  for (int i = 0; i < CANT_FLEX; i++) {
+    anguloServo[i] = SERVOS[i].anguloHome;
+    escribirServo(i, anguloServo[i]);
+    delay(150);
+  }
+  tUltimoRx = millis();   // la pausa no cuenta como SIN SENAL
+}
+
+// Comando h con falla de tension: solo rearma si la tension se recupero
+bool rearmarTension() {
+  if (tension < TENSION_RECUPERADA) {
+    Serial.printf(">>> TENSION: %.2f V, todavia baja (hace falta mas de %.1f V). No se rearma.\n",
+                  tension, TENSION_RECUPERADA);
+    return false;
+  }
+  if (servosApagados) encenderServosEnHome();
+  fallaTension = false;
+  Serial.printf(">>> TENSION: rearmado con %.2f V\n", tension);
+  return true;
+}
+
+// Se llama seguido desde loop(): mide V+ (filtrada) y actua por niveles
+void revisarTension() {
+  static uint32_t tMedicion = 0, tBajoCritica = 0, tBajoCorte = 0, tRecuperada = 0, tAviso = 0;
+  static bool avisoRecuperada = false;
+  uint32_t ahora = millis();
+  if (ahora - tMedicion < 5) return;
+  tMedicion = ahora;
+
+  float v = leerTension();
+  tension = tension == 0 ? v : tension + 0.3f * (v - tension);   // filtro: ~15 ms
+  if (!divisorConectado) {
+    if (ahora - tAviso > 10000) {
+      tAviso = ahora;
+      Serial.printf(">>> TENSION: no se detecta el divisor en GPIO%d (%.2f V): PROTECCION DESACTIVADA\n",
+                    PIN_TENSION, tension);
+    }
+    return;
+  }
+
+  // Corte: servos sueltos (con tan poca tension pueden saltar a cualquier lado)
+  if (tension < TENSION_CORTE) {
+    if (!tBajoCorte) tBajoCorte = ahora;
+    if (!servosApagados && ahora - tBajoCorte >= TIEMPO_CRITICO_MS) {
+      apagarServos();
+      fallaTension = true;
+      irAHome(false);
+      Serial.printf(">>> TENSION DE CORTE: %.2f V (< %.1f V). SERVOS APAGADOS (sueltos, sin fuerza).\n",
+                    tension, TENSION_CORTE);
+      Serial.println(">>> Revisar la fuente. Con la tension recuperada, escribir h para rearmar.");
+    }
+  } else {
+    tBajoCorte = 0;
+  }
+
+  // Critica: deja de seguir al guante y va a HOME (mano abierta: suelta el objeto)
+  if (tension < TENSION_CRITICA) {
+    if (!tBajoCritica) tBajoCritica = ahora;
+    if (!fallaTension && ahora - tBajoCritica >= TIEMPO_CRITICO_MS) {
+      fallaTension = true;
+      irAHome(false);
+      Serial.printf(">>> TENSION CRITICA: %.2f V (< %.1f V). La mano deja de seguir al guante y va a HOME.\n",
+                    tension, TENSION_CRITICA);
+      Serial.println(">>> Revisar la fuente. Con la tension recuperada, escribir h para rearmar.");
+    }
+  } else {
+    tBajoCritica = 0;
+  }
+
+  // Aviso (con histeresis para no repetirlo)
+  if (!avisoTension && tension < TENSION_AVISO) {
+    avisoTension = true;
+    Serial.printf(">>> TENSION BAJA: %.2f V (los servos pierden fuerza por debajo de 4.8 V)\n", tension);
+  } else if (avisoTension && tension > TENSION_AVISO + 0.1f) {
+    avisoTension = false;
+  }
+
+  // En falla: avisa una vez cuando ya se puede rearmar
+  if (fallaTension && tension >= TENSION_RECUPERADA) {
+    if (!tRecuperada) tRecuperada = ahora;
+    if (!avisoRecuperada && ahora - tRecuperada >= TIEMPO_RECUPERADA_MS) {
+      avisoRecuperada = true;
+      Serial.printf(">>> TENSION recuperada (%.2f V): escribir h para rearmar\n", tension);
+    }
+  } else {
+    tRecuperada = 0;
+    avisoRecuperada = false;
   }
 }
 
@@ -774,8 +922,30 @@ void procesar(const Recepcion &r) {
     for (int i = 0; i < CANT_FLEX; i++) Serial.printf(" %5lu", (unsigned long)p.resistencia[i]);
     Serial.print("       |");
     for (int i = 0; i < CANT_FLEX; i++) Serial.printf(" %3d", (int)lroundf(anguloServo[i]));
-    Serial.printf("      | %6lu\n", (unsigned long)perdidos);
+    Serial.printf("      | %6lu", (unsigned long)perdidos);
+    if (divisorConectado) Serial.printf(" | %4.2f V", tension);
+    Serial.println();
   }
+}
+
+// Comando v: muestra la tension; "v 5.12" corrige la medicion con lo que marca
+// el tester en la bornera V+ del PCA9685 (se guarda en la memoria)
+void comandoTension(const char *args) {
+  float real = atof(args);
+  if (real > 0) {
+    float medida = 0;
+    for (int k = 0; k < 20; k++) { medida += leerTension(); delay(2); }
+    medida /= 20;
+    if (medida < TENSION_SIN_DIVISOR) { Serial.println(">>> TENSION: no se detecta el divisor"); return; }
+    factorTension *= real / medida;
+    memoria.putFloat("factorV", factorTension);
+    tension = real;
+    Serial.printf(">>> TENSION: corregida (factor %.3f) y guardada\n", factorTension);
+  }
+  Serial.printf(">>> TENSION servos: %.2f V | aviso < %.1f | critica < %.1f (HOME) | corte < %.1f (servos sueltos)\n",
+                tension, TENSION_AVISO, TENSION_CRITICA, TENSION_CORTE);
+  Serial.printf(">>> Proteccion: %s%s%s\n", divisorConectado ? "ACTIVA" : "DESACTIVADA (sin divisor)",
+                fallaTension ? " | EN FALLA (h para rearmar)" : "", servosApagados ? " | SERVOS APAGADOS" : "");
 }
 
 // =====================================================
@@ -783,6 +953,7 @@ void procesar(const Recepcion &r) {
 // =====================================================
 void ejecutarComando(char *linea) {
   char c = tolower(linea[0]);
+  if (c == 'v') { comandoTension(linea + 1); return; }
   int n = atoi(linea + 1);             // numero de flex (1 a 7), 0 = todos
   if (n < 0 || n > CANT_FLEX) { Serial.println(">>> Numero de flex invalido (1 a 7)"); return; }
   int desde = n ? n - 1 : 0, hasta = n ? n : CANT_FLEX;
@@ -822,7 +993,10 @@ void ejecutarComando(char *linea) {
   } else if (c == 'c') {
     iniciarCalibracionGuiada();
   } else if (c == 'h') {
-    if (homeManual) {
+    if (fallaTension) {
+      // Rearme despues de una falla de tension: vuelve a seguir al guante
+      if (rearmarTension()) homeManual = false;
+    } else if (homeManual) {
       homeManual = false;   // actualizarHome() devuelve el control al guante
       Serial.println(">>> HOME: vuelve a seguir al guante");
     } else {
@@ -838,6 +1012,7 @@ void ejecutarComando(char *linea) {
     imprimirCalibracion();
     Serial.printf(">>> Recibidos %lu  perdidos %lu  largo distinto %lu\n", (unsigned long)recibidos,
                   (unsigned long)perdidos, (unsigned long)largoDistinto);
+    comandoTension("");
   } else if (c == 't' && n) {
     probarServo(n - 1);
   } else if (c == 'a' && n) {
@@ -889,6 +1064,18 @@ void setup() {
   memoria.begin("mano", false);
   cargarCalibracion();
 
+  // Proteccion por baja tension: si no se lee nada, el divisor no esta conectado
+  analogSetPinAttenuation(PIN_TENSION, ADC_11db);   // rango hasta ~3.1 V en el pin
+  factorTension = memoria.getFloat("factorV", 1.0f);
+  for (int k = 0; k < 20; k++) { tension += leerTension(); delay(2); }
+  tension /= 20;
+  divisorConectado = tension >= TENSION_SIN_DIVISOR;
+  if (divisorConectado)
+    Serial.printf("Tension de los servos: %.2f V (proteccion: critica < %.1f V -> HOME, corte < %.1f V)\n",
+                  tension, TENSION_CRITICA, TENSION_CORTE);
+  else
+    Serial.printf("ATENCION: no se detecta el divisor de tension en GPIO%d: PROTECCION DESACTIVADA\n", PIN_TENSION);
+
   Wire.begin(I2C_SDA, I2C_SCL);
   pca.begin();
   pca.setPWMFreq(50);
@@ -922,7 +1109,8 @@ void setup() {
   Serial.println("          m = calibracion de muneca (flex 6 y 7 juntos) | x = quitar compensacion de muneca");
   Serial.println("          o7 = otro lado actual de la muneca | a7 90 170 10 = angulos muneca");
   Serial.println("          s = ver calibracion | t3 = probar servo 3 | a3 10 170 = angulos servo 3 | r = contadores");
-  Serial.println("          h = ir a HOME y quedarse (h otra vez = seguir al guante)");
+  Serial.println("          h = ir a HOME y quedarse (h otra vez = seguir al guante; tambien rearma tras falla de tension)");
+  Serial.println("          v = ver tension de los servos | v 5.12 = corregir con lo que marca el tester");
 
   cola = xQueueCreate(20, sizeof(Recepcion));
   if (esp_now_init() != ESP_OK) {
@@ -958,6 +1146,7 @@ void loop() {
     if (VOLVER_HOME_SIN_SENAL) irAHome(false);
   }
 
+  revisarTension();
   actualizarHome();
 
   // Nunca llego un paquete: avisar cada 3 s (si no, el receptor queda en silencio)
