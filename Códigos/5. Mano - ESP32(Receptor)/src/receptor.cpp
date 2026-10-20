@@ -95,8 +95,23 @@ ServoDedo SERVOS[CANT_FLEX] = {
 
 bool esBidireccional(int i) { return SERVOS[i].anguloOtroLado != SIN_OTRO_LADO; }
 
-// Limitador de velocidad (igual que en la prueba): grados por paquete
-#define PASO_MAXIMO 6.0f
+// =====================================================
+// MOVIMIENTO CONTINUO DE LOS SERVOS
+// =====================================================
+// El guante manda 25 paquetes por segundo y el conversor (ADS) mide la
+// resistencia de a ~12 ohm, que en un dedo son 3 a 7 grados: si el servo se
+// moviera directo a cada valor que llega, avanzaria a saltos. Por eso cada
+// paquete solo fija el OBJETIVO, y el servo se acerca a el 100 veces por
+// segundo con un suavizado (los saltos se convierten en rampas).
+#define PERIODO_SERVOS_MS 10       // actualizacion de los servos (100 por segundo)
+#define SUAVIZADO_SERVOS  0.20f    // fraccion de la distancia al objetivo por actualizacion
+                                   // (mas chico = mas suave pero mas lento; 0.20 -> ~45 ms)
+#define VELOCIDAD_MAXIMA  250.0f   // grados por segundo
+// Zona muerta con histeresis: el servo arranca si el objetivo se aleja mas de
+// ARRANQUE y para cuando queda a menos de PARADA (asi el ruido de la medicion
+// no lo hace temblar quieto)
+#define ZONA_ARRANQUE 1.5f         // grados
+#define ZONA_PARADA   0.3f         // grados
 
 // =====================================================
 // HOME
@@ -217,7 +232,9 @@ uint32_t rPlano[CANT_FLEX], rDoblado[CANT_FLEX];
 uint32_t rOtroLado[CANT_FLEX];   // solo flex bidireccionales: resistencia doblado hacia el otro lado
 bool calibracionGuardada = false;
 float rFiltrada[CANT_FLEX];
-float anguloServo[CANT_FLEX];
+float anguloServo[CANT_FLEX];     // angulo que tiene cada servo ahora
+float objetivoServo[CANT_FLEX];   // angulo al que tiene que ir (segun el guante)
+bool hayObjetivo = false;
 uint32_t ultimaR[CANT_FLEX];
 bool hayDatos = false;
 
@@ -452,12 +469,35 @@ void revisarTension() {
   }
 }
 
-void moverServoSuave(int i, float objetivo) {
-  float dif = objetivo - anguloServo[i];
-  if (fabsf(dif) < 1.0f) return;   // zona muerta: el ruido no hace temblar al servo
-  if (fabsf(dif) <= PASO_MAXIMO) anguloServo[i] = objetivo;
-  else anguloServo[i] += dif > 0 ? PASO_MAXIMO : -PASO_MAXIMO;
-  escribirServo(i, anguloServo[i]);
+// Cada paquete del guante solo fija hacia donde tiene que ir el servo
+void fijarObjetivo(int i, float angulo) {
+  objetivoServo[i] = angulo;
+  hayObjetivo = true;
+}
+
+// Se llama seguido desde loop(): acerca cada servo a su objetivo de forma
+// continua (PERIODO_SERVOS_MS), con suavizado y velocidad maxima
+void actualizarServos() {
+  static uint32_t tAnterior = 0;
+  static bool moviendo[CANT_FLEX];
+  uint32_t ahora = millis();
+  if (ahora - tAnterior < PERIODO_SERVOS_MS) return;
+  float dt = min(ahora - tAnterior, (uint32_t)50) / 1000.0f;
+  tAnterior = ahora;
+  if (enHome || !hayObjetivo) {               // en HOME manda actualizarHome()
+    for (int i = 0; i < CANT_FLEX; i++) moviendo[i] = false;
+    return;
+  }
+
+  float pasoMax = VELOCIDAD_MAXIMA * dt;
+  for (int i = 0; i < CANT_FLEX; i++) {
+    float dif = objetivoServo[i] - anguloServo[i];
+    if (!moviendo[i] && fabsf(dif) < ZONA_ARRANQUE) continue;
+    moviendo[i] = fabsf(dif) >= ZONA_PARADA;
+    if (!moviendo[i]) continue;
+    anguloServo[i] += constrain(dif * SUAVIZADO_SERVOS, -pasoMax, pasoMax);
+    escribirServo(i, anguloServo[i]);
+  }
 }
 
 // Bidireccional: cerca del centro el servo queda quieto en el centro
@@ -905,15 +945,17 @@ void procesar(const Recepcion &r) {
     juntarDatosMuneca(p);
   }
 
+  // Objetivo de cada servo (se calcula siempre, aun en HOME, para que al
+  // salir de HOME el servo vaya directo a donde esta el guante)
   for (int i = 0; i < CANT_FLEX; i++) {
-    if (enHome || esMunecaCompensada(i)) continue;
-    moverServoSuave(i, calcularAngulo(i, rFiltrada[i]));
+    if (esMunecaCompensada(i)) continue;
+    fijarObjetivo(i, calcularAngulo(i, rFiltrada[i]));
   }
-  if (acopleCalibrado && !enHome) {
+  if (acopleCalibrado) {
     float a6, a7;
     calcularMuneca(rFiltrada[FLEX_MUNECA_ADELANTE], rFiltrada[FLEX_MUNECA_LATERAL], a6, a7);
-    moverServoSuave(FLEX_MUNECA_ADELANTE, a6);
-    moverServoSuave(FLEX_MUNECA_LATERAL, a7);
+    fijarObjetivo(FLEX_MUNECA_ADELANTE, a6);
+    fijarObjetivo(FLEX_MUNECA_LATERAL, a7);
   }
 
   if (p.seq % HISTORIAL_CADA_N == 0 && calEstado == CAL_NO) {
@@ -1050,6 +1092,9 @@ void leerComandos() {
 // SETUP Y LOOP
 // =====================================================
 void setup() {
+  // Buffer grande: imprimir una linea no frena el programa mientras sale por
+  // el USB (a 115200 baudios cada linea del historial tarda ~12 ms)
+  Serial.setTxBufferSize(2048);
   Serial.begin(115200);
   delay(500);
 
@@ -1148,6 +1193,7 @@ void loop() {
 
   revisarTension();
   actualizarHome();
+  actualizarServos();
 
   // Nunca llego un paquete: avisar cada 3 s (si no, el receptor queda en silencio)
   static uint32_t ultimoAvisoEspera = millis();
