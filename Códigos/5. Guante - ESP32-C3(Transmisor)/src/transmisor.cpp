@@ -1,13 +1,17 @@
 // =====================================================
 // TRANSMISOR - ESP32-C3 MINI (guante, COM5)
-// Lee los 7 sensores flex (2 multiplexores -> ADS1115),
-// calcula la resistencia de cada uno y la envia por ESP-NOW
-// al receptor (mano robot).
+// Lee los 7 sensores flex y los 10 potenciometros de los dedos
+// (2 multiplexores -> ADS1115), calcula la resistencia de cada flex y
+// manda todo por ESP-NOW al receptor (mano robot).
 //
 // Conexionado igual que Conexionado_guante-v3:
-//   Flex 1      -> multiplexor 2, canal 0     -> A1 del ADS1115
-//   Flex 2 al 7 -> multiplexor 1, canales 1-6 -> A0 del ADS1115
-// (Los 10 potenciometros se agregan mas adelante.)
+//   Flex 1           -> multiplexor 2, canal 0      -> A1 del ADS1115
+//   Flex 2 al 7      -> multiplexor 1, canales 1-6  -> A0 del ADS1115
+//   Pot. base (x5)   -> multiplexor 1, canales 7-11 -> A0 (pulgar ... menique)
+//   Pot. arriba (x5) -> multiplexor 2, canales 1-5  -> A1 (pulgar ... menique)
+//
+// El conversor mide de a 16 cuentas (~2 mV): probablemente es un ADS1015
+// (12 bits) vendido como ADS1115. Un ADS1115 original mide 16 veces mas fino.
 //
 // Flex 7 (costado de la muneca) es bidireccional: al doblarlo hacia un
 // lado SUBE su resistencia y hacia el otro BAJA. Aca no se limita nada,
@@ -63,6 +67,28 @@ const SensorFlex FLEX[CANT_FLEX] = {
   {6, ADS_CANAL_MUX1},   // Flex 7
 };
 
+// =====================================================
+// POTENCIOMETROS DEL MECANISMO DE CADA DEDO (Mecanismo de sensorizacion.iam)
+// Dos por dedo, en el orden de pot[] del paquete:
+//   base (apertura lateral) -> multiplexor 1, C7 pulgar ... C11 menique
+//   arriba (flexion nudillo) -> multiplexor 2, C1 pulgar ... C5 menique
+// (verificado moviendo cada dedo el 2026-10-24; M2 C6 no se usa)
+// =====================================================
+const SensorFlex POT[CANT_POT] = {
+  {7,  ADS_CANAL_MUX1},   // base pulgar
+  {8,  ADS_CANAL_MUX1},   // base indice
+  {9,  ADS_CANAL_MUX1},   // base medio
+  {10, ADS_CANAL_MUX1},   // base anular
+  {11, ADS_CANAL_MUX1},   // base menique
+  {1,  ADS_CANAL_MUX2},   // arriba pulgar
+  {2,  ADS_CANAL_MUX2},   // arriba indice
+  {3,  ADS_CANAL_MUX2},   // arriba medio
+  {4,  ADS_CANAL_MUX2},   // arriba anular
+  {5,  ADS_CANAL_MUX2},   // arriba menique
+};
+const char *NOMBRE_POT[CANT_POT] = {"Bpul", "Bind", "Bmed", "Banu", "Bmen",
+                                    "Apul", "Aind", "Amed", "Aanu", "Amen"};
+
 Adafruit_ADS1115 ads;
 
 // =====================================================
@@ -74,7 +100,7 @@ Adafruit_ADS1115 ads;
 #define R_FIJA      10000.0f   // resistencia fija del divisor (ohms)
 
 // Lecturas por sensor en cada envio (la mediana descarta picos).
-// 7 flex x 3 lecturas entran comodas en los 40 ms entre envios.
+// 7 flex x 3 lecturas + 10 potenciometros x 1 = ~28 ms (entra en los 40 ms).
 #define MUESTRAS_MEDIANA 3
 
 // =====================================================
@@ -118,10 +144,18 @@ uint32_t calcularResistencia(int16_t adc) {
   return r < 0 ? 0 : (uint32_t)r;
 }
 
+// Un potenciometro es un divisor de baja impedancia: con una lectura alcanza
+int16_t leerPot(const SensorFlex &s) {
+  selectMuxChannel(s.canalMux);
+  return ads.readADC_SingleEnded(s.entradaAds);
+}
+
 void imprimirEncabezado() {
   Serial.print("ENVIADO     tiempo     seq |");
   for (int i = 0; i < CANT_FLEX; i++) Serial.printf("    R%d", i + 1);
-  Serial.println(" (ohm) | lect.  ACK ok");
+  Serial.print(" (ohm) |");
+  for (int i = 0; i < CANT_POT; i++) Serial.printf(" %5s", NOMBRE_POT[i]);
+  Serial.println(" | lect.  ACK ok");
 }
 
 void setup() {
@@ -132,7 +166,7 @@ void setup() {
   Serial.setTxTimeoutMs(1);
   delay(1500);
 
-  Serial.println("\n=== GUANTE: 7 FLEX -> ESP-NOW (ESP32-C3) ===");
+  Serial.println("\n=== GUANTE: 7 FLEX + 10 POTENCIOMETROS -> ESP-NOW (ESP32-C3) ===");
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);                     // I2C rapido: 21 lecturas por envio
@@ -188,6 +222,7 @@ void loop() {
     p.adc[i] = leerFlex(FLEX[i]);
     p.resistencia[i] = calcularResistencia(p.adc[i]);
   }
+  for (int i = 0; i < CANT_POT; i++) p.pot[i] = leerPot(POT[i]);
   uint32_t tiempoLectura = millis() - inicioLectura;
 
   p.tipo = TIPO_GUANTE;
@@ -200,7 +235,9 @@ void loop() {
     uint32_t ok = ackOk, fail = ackFallidos;
     Serial.printf("ENVIADO  %8.2f s  #%6lu |", p.t_ms / 1000.0, (unsigned long)p.seq);
     for (int i = 0; i < CANT_FLEX; i++) Serial.printf(" %5lu", (unsigned long)p.resistencia[i]);
-    Serial.printf("       | %2lu ms  %5.1f%%\n", (unsigned long)tiempoLectura,
+    Serial.print("       |");
+    for (int i = 0; i < CANT_POT; i++) Serial.printf(" %5d", p.pot[i]);
+    Serial.printf(" | %2lu ms  %5.1f%%\n", (unsigned long)tiempoLectura,
                   ok + fail ? 100.0 * ok / (ok + fail) : 0.0);
   }
 }

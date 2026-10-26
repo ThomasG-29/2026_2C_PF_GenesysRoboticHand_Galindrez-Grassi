@@ -15,9 +15,15 @@
 #define TIPO_GUANTE 5
 
 // Cantidad de sensores flex del guante.
-// (Los 10 potenciometros se agregan mas adelante: sumar aca un
-//  arreglo pot[CANT_POT] al final del paquete, en los dos archivos.)
 #define CANT_FLEX 7
+
+// Potenciometros del mecanismo de cada dedo (2 por dedo), en este orden:
+//   pot[0..4] base  (apertura lateral): pulgar, indice, medio, anular, menique
+//   pot[5..9] arriba (flexion del nudillo): pulgar, indice, medio, anular, menique
+// El dedo medio se manda igual aunque por ahora la mano no lo use.
+#define CANT_POT 10
+#define POT_BASE   0   // primer potenciometro de la base
+#define POT_ARRIBA 5   // primer potenciometro de arriba
 
 // Cada cuantos paquetes se imprime una linea de historial.
 // Los dos lados imprimen los MISMOS numeros de secuencia
@@ -30,4 +36,5 @@ typedef struct __attribute__((packed)) {
   uint32_t t_ms;                     // millis() del transmisor al medir
   int16_t  adc[CANT_FLEX];           // lecturas del ADS1115 (filtradas con mediana)
   uint32_t resistencia[CANT_FLEX];   // resistencia de cada flex en ohms
+  int16_t  pot[CANT_POT];            // lectura de cada potenciometro (cuentas del ADS, 3.3 V = ~26400)
 } PaqueteGuante;
