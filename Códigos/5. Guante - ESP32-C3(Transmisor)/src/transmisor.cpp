@@ -1,22 +1,22 @@
 // =====================================================
 // TRANSMISOR - ESP32-C3 MINI (guante, COM5)
-// Lee los 7 sensores flex y los 10 potenciometros de los dedos
+// Lee los 8 sensores flex y los 10 potenciometros de los dedos
 // (2 multiplexores -> ADS1115), calcula la resistencia de cada flex y
 // manda todo por ESP-NOW al receptor (mano robot).
 //
 // Conexionado igual que Conexionado_guante-v3:
 //   Flex 1           -> multiplexor 2, canal 0      -> A1 del ADS1115
 //   Flex 2 al 7      -> multiplexor 1, canales 1-6  -> A0 del ADS1115
+//   Flex 8           -> multiplexor 1, canal 12     -> A0 (costado del pulgar de la muneca)
 //   Pot. base (x5)   -> multiplexor 1, canales 7-11 -> A0 (pulgar ... menique)
 //   Pot. arriba (x5) -> multiplexor 2, canales 1-5  -> A1 (pulgar ... menique)
 //
 // El conversor mide de a 16 cuentas (~2 mV): probablemente es un ADS1015
 // (12 bits) vendido como ADS1115. Un ADS1115 original mide 16 veces mas fino.
 //
-// Flex 7 (costado de la muneca) es bidireccional: al doblarlo hacia un
-// lado SUBE su resistencia y hacia el otro BAJA. Aca no se limita nada,
-// se manda la resistencia tal cual y el receptor decide hacia que lado
-// mover el servo.
+// Flex 6, 7 y 8 (muneca): se arrastran entre si por como estan en el guante.
+// Aca no se corrige nada, se manda la resistencia tal cual y el receptor
+// separa el movimiento hacia adelante del movimiento hacia los costados.
 // =====================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -65,6 +65,7 @@ const SensorFlex FLEX[CANT_FLEX] = {
   {4, ADS_CANAL_MUX1},   // Flex 5
   {5, ADS_CANAL_MUX1},   // Flex 6
   {6, ADS_CANAL_MUX1},   // Flex 7
+  {12, ADS_CANAL_MUX1},  // Flex 8 (costado del pulgar de la muneca)
 };
 
 // =====================================================
@@ -100,7 +101,7 @@ Adafruit_ADS1115 ads;
 #define R_FIJA      10000.0f   // resistencia fija del divisor (ohms)
 
 // Lecturas por sensor en cada envio (la mediana descarta picos).
-// 7 flex x 3 lecturas + 10 potenciometros x 1 = ~28 ms (entra en los 40 ms).
+// 8 flex x 3 lecturas + 10 potenciometros x 1 = ~31 ms (entra en los 40 ms).
 #define MUESTRAS_MEDIANA 3
 
 // =====================================================
@@ -166,7 +167,7 @@ void setup() {
   Serial.setTxTimeoutMs(1);
   delay(1500);
 
-  Serial.println("\n=== GUANTE: 7 FLEX + 10 POTENCIOMETROS -> ESP-NOW (ESP32-C3) ===");
+  Serial.println("\n=== GUANTE: 8 FLEX + 10 POTENCIOMETROS -> ESP-NOW (ESP32-C3) ===");
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);                     // I2C rapido: 21 lecturas por envio

@@ -14,8 +14,10 @@
 
 #define TIPO_GUANTE 5
 
-// Cantidad de sensores flex del guante.
-#define CANT_FLEX 7
+// Cantidad de sensores flex del guante: 1-5 dedos, 6 muneca adelante,
+// 7 y 8 costados de la muneca (el 8, del lado del pulgar, no tiene servo:
+// el receptor lo usa para separar el costado del movimiento hacia adelante).
+#define CANT_FLEX 8
 
 // Potenciometros del mecanismo de cada dedo (2 por dedo), en este orden:
 //   pot[0..4] base  (apertura lateral): pulgar, indice, medio, anular, menique

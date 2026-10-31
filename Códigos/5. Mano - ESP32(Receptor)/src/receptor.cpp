@@ -1,11 +1,13 @@
 // =====================================================
 // RECEPTOR - ESP32 (mano robot, COM3)
-// Recibe por ESP-NOW los 7 flex y los 10 potenciometros del guante y mueve
+// Recibe por ESP-NOW los 8 flex y los 10 potenciometros del guante y mueve
 // un servo por sensor (PCA9685) segun la calibracion (estirado -> doblado).
 // Cada sensor con su servo es un "canal" (1 a 16, ver SERVOS[]):
 //
 //   canal 1-5   flex 1 al 5               -> MG90S  S1 a S5   (PCA 0 a 4)
 //   canal 6-7   flex 6 y 7 (muneca)       -> DS3225 S11 y S12 (PCA 10 y 11)
+//               flex 8 (costado del pulgar de la muneca) no tiene servo ni
+//               canal propio: se usa para la compensacion de muneca
 //   canal 8-11  pot. base (apertura)      -> MG92B  S13 a S16 (PCA 12 a 15)
 //               pulgar, indice, anular, menique
 //   canal 12-15 pot. arriba (nudillo)     -> MG90S  S6, S7, S9, S10 (PCA 5, 6, 8, 9)
@@ -14,17 +16,20 @@
 //   El dedo medio no tiene apertura lateral: su potenciometro de la base no se usa.
 //   (segun Conexionados/Circuito_mano_robot)
 //
-// Flex 7 (costado de la muneca) mueve la muneca lateral hacia LOS DOS LADOS,
-// pero un flex solo mide bien doblandose hacia un lado. Por eso va montado
-// PRE-CURVADO: con la muneca derecha ya esta semi-doblado.
-//   muneca al menique -> el flex se dobla mas  -> sube R  -> servo a anguloDoblado (170)
-//   muneca derecha    -> semi-doblado          -> R medio -> servo a anguloPlano (90)
-//   muneca al pulgar  -> el flex se endereza   -> baja R  -> servo a anguloOtroLado (10)
+// MUNECA: flex 6 (adelante), flex 7 y flex 8 (los dos costados). Los tres se
+// arrastran entre si por como estan en el guante, asi que con la muneca
+// calibrada (comando m) se mueven juntos (ver COMPENSACION DE LA MUNECA):
+//   - el costado sale SOLO de los flex 7 y 8: si cambian en la misma proporcion
+//     que al ir hacia adelante (los dos casi igual) no es costado; si uno sube
+//     y el otro baja (o no cambia), es costado.
+//   - adelante sale del flex 6, restandole lo que le sube por el costado.
+// El servo lateral (S12) es uno solo y va hacia los dos lados:
+//   muneca al menique -> anguloDoblado (170) | derecha -> anguloPlano (90) | al pulgar -> anguloOtroLado (10)
 // Si el servo gira al reves, intercambiar esos dos angulos (a7 90 10 170).
 //
-// Compensacion de muneca (comando m): restaba el arrastre entre los flex 6 y 7
-// con el guante puesto. Esta APAGADA (USAR_COMPENSACION_MUNECA 0): si los flex
-// no se arrastran, inventaba un movimiento lateral al doblar solo el flex 6.
+// Sin la calibracion de muneca (o despues de x), cada flex mueve su servo como
+// antes: flex 6 adelante y flex 7 PRE-CURVADO hacia los dos lados (sube R ->
+// anguloDoblado, baja R -> anguloOtroLado); el flex 8 no se usa.
 //
 // La calibracion se guarda en la memoria del ESP32 (no se pierde al
 // apagar). Al arrancar, el estirado se vuelve a medir con los primeros
@@ -36,9 +41,10 @@
 //            cerrar la mano y mover la muneca (10 s), separar los dedos (6 s)
 //   p / d  : tomar el valor actual de TODOS los canales como estirado / doblado
 //   p3, d3 : lo mismo pero solo para el canal 3 (1 a 16)
-//   m      : calibracion de muneca: centro, adelante, costado del menique y
-//            del pulgar (7 s cada postura). Mide y compensa el acople 6-7.
-//            Con la muneca compensada, c no toca los flex 6 y 7.
+//   m      : calibracion de muneca con el guante puesto: centro, adelante, costado
+//            del menique y del pulgar (7 s cada postura). Mide cuanto cambian los
+//            flex 6, 7 y 8 en cada postura y separa los dos movimientos.
+//            Con la muneca compensada, c solo vuelve a tomar su centro.
 //   x      : quitar la compensacion de muneca (cada flex por separado)
 //   o7     : tomar la resistencia actual del flex 7 como "otro lado"
 //            (solo flex bidireccionales)
@@ -77,6 +83,11 @@
 #define MG90S_MAX_US  2400
 #define DS3225_MIN_US 500
 #define DS3225_MAX_US 2500
+// Servos de los dedos (flex S1-S5 y nudillos S6-S10): pulso ampliado para sacarles mas recorrido. El
+// servo gira mientras su potenciometro interno lo permita (~190-210 grados);
+// si en un extremo zumba o se descontrola, achicar estos valores.
+#define MG90S_DEDOS_MIN_US 400
+#define MG90S_DEDOS_MAX_US 2600
 #define MG92B_MIN_US  500
 #define MG92B_MAX_US  2500
 
@@ -117,22 +128,22 @@ typedef struct {
 #define CANT_CANALES 16
 //                          sensor                    PCA  pulso                       estirado doblado otro lado   HOME
 ServoDedo SERVOS[CANT_CANALES] = {
-  {"S1 MG90S",   "F1",   SENSOR_FLEX, 0,                0, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO,  10},  // 1 flex 1
-  {"S2 MG90S",   "F2",   SENSOR_FLEX, 1,                1, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO,  10},  // 2 flex 2
-  {"S3 MG90S",   "F3",   SENSOR_FLEX, 2,                2, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO,  10},  // 3 flex 3
-  {"S4 MG90S",   "F4",   SENSOR_FLEX, 3,                3, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO,  10},  // 4 flex 4
-  {"S5 MG90S",   "F5",   SENSOR_FLEX, 4,                4, MG90S_MIN_US,  MG90S_MAX_US,  10, 170, SIN_OTRO_LADO,  10},  // 5 flex 5
+  {"S1 MG90S",   "F1",   SENSOR_FLEX, 0,                0, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 1 flex 1
+  {"S2 MG90S",   "F2",   SENSOR_FLEX, 1,                1, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 2 flex 2
+  {"S3 MG90S",   "F3",   SENSOR_FLEX, 2,                2, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 3 flex 3
+  {"S4 MG90S",   "F4",   SENSOR_FLEX, 3,                3, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 4 flex 4
+  {"S5 MG90S",   "F5",   SENSOR_FLEX, 4,                4, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 5 flex 5
   {"S11 DS3225", "F6",   SENSOR_FLEX, 5,               10, DS3225_MIN_US, DS3225_MAX_US, 10, 170, SIN_OTRO_LADO,  10},  // 6 flex 6 (muneca adelante)
   {"S12 DS3225", "F7",   SENSOR_FLEX, 6,               11, DS3225_MIN_US, DS3225_MAX_US, 90, 170, 10,             90},  // 7 flex 7 (muneca lateral)
   {"S13 MG92B",  "Bpul", SENSOR_POT,  POT_BASE + 0,    12, MG92B_MIN_US,  MG92B_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 8 apertura pulgar
   {"S14 MG92B",  "Bind", SENSOR_POT,  POT_BASE + 1,    13, MG92B_MIN_US,  MG92B_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 9 apertura indice
   {"S15 MG92B",  "Banu", SENSOR_POT,  POT_BASE + 3,    14, MG92B_MIN_US,  MG92B_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 10 apertura anular
   {"S16 MG92B",  "Bmen", SENSOR_POT,  POT_BASE + 4,    15, MG92B_MIN_US,  MG92B_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 11 apertura menique
-  {"S6 MG90S",   "Apul", SENSOR_POT,  POT_ARRIBA + 0,   5, MG90S_MIN_US,  MG90S_MAX_US,  10, 100, SIN_OTRO_LADO,  10},  // 12 nudillo pulgar
-  {"S7 MG90S",   "Aind", SENSOR_POT,  POT_ARRIBA + 1,   6, MG90S_MIN_US,  MG90S_MAX_US,  10, 100, SIN_OTRO_LADO,  10},  // 13 nudillo indice
-  {"S9 MG90S",   "Aanu", SENSOR_POT,  POT_ARRIBA + 3,   8, MG90S_MIN_US,  MG90S_MAX_US,  10, 100, SIN_OTRO_LADO,  10},  // 14 nudillo anular
-  {"S10 MG90S",  "Amen", SENSOR_POT,  POT_ARRIBA + 4,   9, MG90S_MIN_US,  MG90S_MAX_US,  10, 100, SIN_OTRO_LADO,  10},  // 15 nudillo menique
-  {"S8 MG90S",   "Amed", SENSOR_POT,  POT_ARRIBA + 2,   7, MG90S_MIN_US,  MG90S_MAX_US,  10, 100, SIN_OTRO_LADO,  10},  // 16 nudillo medio (M2 C3)
+  {"S6 MG90S",   "Apul", SENSOR_POT,  POT_ARRIBA + 0,   5, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 12 nudillo pulgar
+  {"S7 MG90S",   "Aind", SENSOR_POT,  POT_ARRIBA + 1,   6, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 13 nudillo indice
+  {"S9 MG90S",   "Aanu", SENSOR_POT,  POT_ARRIBA + 3,   8, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 14 nudillo anular
+  {"S10 MG90S",  "Amen", SENSOR_POT,  POT_ARRIBA + 4,   9, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 15 nudillo menique
+  {"S8 MG90S",   "Amed", SENSOR_POT,  POT_ARRIBA + 2,   7, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 16 nudillo medio (M2 C3)
 };
 
 // Valor del sensor de cada canal en un paquete (ohm para flex, cuentas para potenciometros)
@@ -249,30 +260,54 @@ bool esBidireccional(int i) { return SERVOS[i].anguloOtroLado != SIN_OTRO_LADO; 
 #define ZONA_CENTRO_OTRO_LADO 0.10f   // 10% del recorrido hacia el pulgar (pre-curvado:
                                       // los dos lados tienen recorrido parecido)
 
-// 0: cada flex de la muneca mueve solo su servo (flex montados para no arrastrarse)
-// 1: compensacion del arrastre entre flex 6 y 7 (hay que calibrarla con m)
-#define USAR_COMPENSACION_MUNECA 0
+// =====================================================
+// COMPENSACION DE LA MUNECA (flex 6, 7 y 8)
+// =====================================================
+// Por como estan en el guante, los flex de la muneca se arrastran entre si:
+// al doblarla hacia adelante suben el 6 y TAMBIEN los dos laterales (7 y 8),
+// y al llevarla a un costado el 6 tambien cambia un poco. El flex 8 (costado
+// del pulgar) se agrego para poder separar los dos movimientos.
+// La calibracion de muneca (comando m) mide cuanto cambia cada flex en cada
+// postura (adelante, costado del menique, costado del pulgar) con el guante
+// puesto, y en cada paquete:
+//   1) COSTADO, solo con los flex 7 y 8: hacia adelante cambian en una
+//      proporcion fija (casi iguales); hacia un costado uno sube y el otro baja
+//      o no cambia. Lo que (R7, R8) se aparta de la proporcion de adelante es
+//      costado; lo que la respeta es adelante y NO mueve el servo lateral.
+//      (si adelante los dos subieran exactamente igual, el costado seria
+//      simplemente la diferencia R8 - R7). El sentido de ese apartamiento dice
+//      hacia que costado va, y su tamano comparado con el de la calibracion,
+//      cuanto (0 a 1).
+//   2) ADELANTE, con el flex 6, restandole lo que sube por ese costado
+//      (medido en la calibracion): un costado puro NO mueve el servo de adelante.
+#define FLEX_MUNECA_ADELANTE 5   // flex 6 (indice 5): adelante, servo S11 (canal 6)
+#define FLEX_MUNECA_LATERAL  6   // flex 7 (indice 6): costado, servo S12 (canal 7)
+#define FLEX_MUNECA_PULGAR   7   // flex 8 (indice 7): costado del pulgar, sin servo propio
+// Los tres flex de la muneca, en el orden de los arreglos de la compensacion
+const uint8_t FLEX_MUNECA[3] = {FLEX_MUNECA_ADELANTE, FLEX_MUNECA_LATERAL, FLEX_MUNECA_PULGAR};
+enum { M6, M7, M8 };
 
-// =====================================================
-// COMPENSACION DE LA MUNECA (acople entre flex 6 y 7)
-// =====================================================
-// Los dos flex de la muneca se arrastran entre si: al doblarla hacia
-// adelante el flex 7 tambien sube, y al llevarla a un costado el 6 tambien.
-// La calibracion de muneca (comando m) mide cuanto cambia CADA flex en cada
-// postura (adelante, un costado, el otro) y con eso se separan los dos
-// movimientos resolviendo un sistema de 2x2:
-//   cambio R6 = f * adelante.R6 + s * costado.R6
-//   cambio R7 = f * adelante.R7 + s * costado.R7
-//   f = cuanto esta doblada hacia adelante (0..1), s = costado (-1..1)
-#define FLEX_MUNECA_ADELANTE 5   // flex 6 (indice 5)
-#define FLEX_MUNECA_LATERAL  6   // flex 7 (indice 6)
+// Calibracion de muneca: un costado se usa si los flex 7 y 8 cambian al menos
+// esto (entre los dos) y distinto que hacia adelante: SEPARACION_MINIMA = 0
+// seria igual que adelante, 1 = totalmente distinto (por ejemplo, adelante los
+// dos suben igual y hacia el costado uno sube y el otro baja lo mismo)
+#define RANGO_MINIMO_COSTADO 150      // ohms
+#define SEPARACION_MINIMA    0.30f
+// Si hacia adelante los flex 7 y 8 casi no cambian, se toma que adelante
+// los mueve igual (cualquier cambio igual en los dos no es costado)
 
 // El flex 6 tampoco vuelve siempre al mismo valor (+~90 ohm despues de doblarlo)
 #define ZONA_CENTRO_ADELANTE 0.20f
-// Cuanto R7 sube al doblar hacia adelante varia (+220 a +410 ohm), y la
+// Zona muerta del costado (fraccion del recorrido de la calibracion). Despues
+// de doblarse, el flex 7 tarda unos segundos en volver a su valor, y cerrar el
+// puno tira de los flex 7 y 8: con la muneca derecha eso da hasta ~40% de
+// costado (prueba del 2026-10-31). Mas grande = menos falsos movimientos pero
+// el servo lateral arranca mas tarde.
+#define ZONA_CENTRO_COSTADO 0.30f
+// Cuanto suben los laterales al doblar hacia adelante varia un poco, y la
 // diferencia parece un costado: con la muneca hacia adelante la zona muerta
 // del costado crece hasta este porcentaje del recorrido que queda
-#define ZONA_LATERAL_EXTRA_ADELANTE 0.60f
+#define ZONA_LATERAL_EXTRA_ADELANTE 0.40f
 
 // Calibracion de muneca: cada postura dura CAL_POSTURA_MS y se promedian los
 // valores despues de CAL_DESCARTE_MS (el tiempo de llegar a la postura)
@@ -300,6 +335,7 @@ bool calibracionGuardada = false;
 int canalesGuardados = 0;          // canales con calibracion en la memoria (una vieja puede tener menos)
 bool modoAjuste = false;           // comando w: muestra solo los potenciometros
 float rFiltrada[CANT_CANALES];
+float rFiltradaMuneca[3];            // R6, R7, R8 filtradas (el flex 8 no es un canal)
 float anguloServo[CANT_CANALES];     // angulo que tiene cada servo ahora
 float objetivoServo[CANT_CANALES];   // angulo al que tiene que ir (segun el guante)
 bool hayObjetivo = false;
@@ -327,24 +363,24 @@ bool sinSenalAvisado = false;
 bool calibrandoInicio = CALIBRAR_PLANO_AL_INICIO;
 uint32_t calCant = 0;
 uint64_t calSuma[CANT_CANALES];
+uint64_t calSumaMuneca[3];   // R6, R7, R8 (para volver a tomar el centro de la muneca compensada)
 
 // Calibracion guiada
 enum { CAL_NO, CAL_ABIERTA, CAL_CERRADA, CAL_SEPARAR, CAL_MUNECA } calEstado = CAL_NO;
 uint32_t calInicio = 0, calUltimoAviso = 0;
 float calMax[CANT_CANALES], calMin[CANT_CANALES];
 
-// Compensacion de la muneca: cambio del OTRO flex en cada postura (ohms).
-// El cambio del flex propio sale de rDoblado/rOtroLado - rPlano.
-typedef struct {
-  int32_t r7Adelante;   // cambio de R7 con la muneca hacia adelante
-  int32_t r6Lado;       // cambio de R6 con la muneca hacia el lado donde SUBE R7
-  int32_t r6OtroLado;   // cambio de R6 con la muneca hacia el lado donde BAJA R7
-} AcopleMuneca;
-AcopleMuneca acople = {0, 0, 0};
-bool acopleCalibrado = false;
-
 // Calibracion de muneca (comando m): una fase por postura
-enum { POSTURA_CENTRO, POSTURA_ADELANTE, POSTURA_LADO1, POSTURA_LADO2, CANT_POSTURAS };
+enum { POSTURA_CENTRO, POSTURA_ADELANTE, POSTURA_MENIQUE, POSTURA_PULGAR, CANT_POSTURAS };
+
+// Compensacion de la muneca: valores de los flex 6, 7 y 8 (en el orden M6, M7, M8)
+typedef struct {
+  float centro[3];                  // resistencia con la muneca derecha (guante puesto)
+  float cambio[CANT_POSTURAS][3];   // cuanto cambia cada flex en cada postura respecto
+                                    // del centro (la fila POSTURA_CENTRO no se usa)
+} CalMuneca;
+CalMuneca muneca;
+bool munecaCalibrada = false;
 typedef struct {
   uint8_t postura;
   uint16_t duracionMs;
@@ -354,14 +390,14 @@ const FaseMuneca FASES_MUNECA[] = {
   {POSTURA_CENTRO,   CAL_CENTRO_MS,  "Muneca derecha y quieta"},
   {POSTURA_ADELANTE, CAL_POSTURA_MS, "Muneca hacia adelante, al maximo, y mantener"},
   {POSTURA_CENTRO,   CAL_CENTRO_MS,  "Volver al centro"},
-  {POSTURA_LADO1,    CAL_POSTURA_MS, "Muneca al costado del menique, al maximo, y mantener"},
+  {POSTURA_MENIQUE,  CAL_POSTURA_MS, "Muneca al costado del menique, al maximo, y mantener"},
   {POSTURA_CENTRO,   CAL_CENTRO_MS,  "Volver al centro"},
-  {POSTURA_LADO2,    CAL_POSTURA_MS, "Muneca al costado del pulgar, al maximo, y mantener"},
+  {POSTURA_PULGAR,   CAL_POSTURA_MS, "Muneca al costado del pulgar, al maximo, y mantener"},
   {POSTURA_CENTRO,   CAL_CENTRO_MS,  "Volver al centro"},
 };
 const int CANT_FASES_MUNECA = sizeof(FASES_MUNECA) / sizeof(FASES_MUNECA[0]);
 int faseMuneca = 0;
-float munSuma6[CANT_POSTURAS], munSuma7[CANT_POSTURAS];
+float munSuma[CANT_POSTURAS][3];
 uint32_t munCant[CANT_POSTURAS];
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -595,59 +631,78 @@ float calcularAngulo(int i, float r) {
   return s.anguloPlano + t * (s.anguloDoblado - s.anguloPlano);
 }
 
-// Muneca con compensacion: separa "adelante" (f) y "costado" (s) a partir de
-// R6 y R7 juntos (ver COMPENSACION DE LA MUNECA arriba) y da los dos angulos
-void calcularMuneca(float r6, float r7, float &angulo6, float &angulo7) {
-  const int A = FLEX_MUNECA_ADELANTE, L = FLEX_MUNECA_LATERAL;
-  // Cambio respecto del centro, y cambio de cada flex en cada postura
-  float x6 = r6 - (float)rPlano[A], x7 = r7 - (float)rPlano[L];
-  // R6 solo sube al doblar la muneca: si baja (por ejemplo, al cerrar el puno
-  // el guante tira del flex) no es un costado, se toma como centro
-  if (x6 < 0) x6 = 0;
-  float adel6 = (float)rDoblado[A] - rPlano[A], adel7 = acople.r7Adelante;
-  float lado6 = acople.r6Lado,     lado7 = (float)rDoblado[L] - rPlano[L];
-  float otro6 = acople.r6OtroLado, otro7 = (float)rOtroLado[L] - rPlano[L];
+// =====================================================
+// COMPENSACION DE LA MUNECA (ver la explicacion arriba)
+// =====================================================
+// Proporcion en que cambian los flex 7 y 8 al ir hacia adelante (como vector
+// de largo 1). Si adelante casi no los mueve: "los dos iguales".
+void proporcionAdelante(const CalMuneca &c, float &p7, float &p8) {
+  p7 = c.cambio[POSTURA_ADELANTE][M7];
+  p8 = c.cambio[POSTURA_ADELANTE][M8];
+  float largo = hypotf(p7, p8);
+  if (largo < RANGO_MINIMO_COSTADO) { p7 = p8 = 1.0f; largo = sqrtf(2.0f); }
+  p7 /= largo;
+  p8 /= largo;
+}
 
-  float f = 0, s = 0;
-  bool resuelto = false;
-  // Primero se prueba hacia el lado donde sube R7...
-  float det = adel6 * lado7 - lado6 * adel7;
-  if (fabsf(det) > 1.0f) {
-    s = (adel6 * x7 - adel7 * x6) / det;
-    f = (x6 * lado7 - lado6 * x7) / det;
-    resuelto = s >= 0;
-  }
-  // ...y si da negativo, hacia el otro lado
-  if (!resuelto && esBidireccional(L)) {
-    det = adel6 * otro7 - otro6 * adel7;
-    if (fabsf(det) > 1.0f) {
-      float so = (adel6 * x7 - adel7 * x6) / det;
-      if (so >= 0) {
-        f = (x6 * otro7 - otro6 * x7) / det;
-        s = -so;
-        resuelto = true;
-      }
-    }
-  }
-  // Ninguno cierra (muneca casi en el centro): solo adelante
-  if (!resuelto) {
-    s = 0;
-    f = adel6 != 0 ? x6 / adel6 : 0;
-  }
+// Cuanto se aparta un cambio (x7, x8) de los flex laterales de la proporcion
+// de adelante (en ohm). 0 = adelante puro o centro; el signo dice el costado.
+float desvioCostado(const CalMuneca &c, float x7, float x8) {
+  float p7, p8;
+  proporcionAdelante(c, p7, p8);
+  return p7 * x8 - p8 * x7;
+}
 
-  const ServoDedo &sa = SERVOS[A], &sl = SERVOS[L];
+// Un costado se usa si en la calibracion los flex 7 y 8 cambiaron bastante y
+// distinto que hacia adelante (desvio / cambio = 0 igual que adelante, 1 opuesto)
+bool costadoValido(const CalMuneca &c, int postura) {
+  float l7 = c.cambio[postura][M7], l8 = c.cambio[postura][M8];
+  float largo = hypotf(l7, l8);
+  return largo >= RANGO_MINIMO_COSTADO && fabsf(desvioCostado(c, l7, l8)) >= SEPARACION_MINIMA * largo;
+}
+
+// Postura de la muneca a partir del cambio de R6, R7 y R8 respecto del centro:
+//   f = hacia adelante (0 = derecha, 1 = como en la calibracion)
+//   s = costado (+ menique, - pulgar; 1 = como en la calibracion)
+void posturaMuneca(const float x[3], float &f, float &s) {
+  // 1) Costado, solo con los flex 7 y 8: el desvio respecto de la proporcion
+  //    de adelante se compara con el de cada costado en la calibracion
+  float d = desvioCostado(muneca, x[M7], x[M8]);
+  float arrastre6 = 0;   // lo que cambia el flex 6 por el costado
+  s = 0;
+  const int lados[] = {POSTURA_MENIQUE, POSTURA_PULGAR};
+  for (int lado : lados) {
+    float dLado = desvioCostado(muneca, muneca.cambio[lado][M7], muneca.cambio[lado][M8]);
+    if (!costadoValido(muneca, lado) || d * dLado <= 0) continue;   // es hacia el otro costado
+    float t = d / dLado;
+    // Solo se resta lo que el costado SUBE al flex 6: si lo baja, no se suma
+    // (no siempre baja lo mismo, y sumarlo de mas parecia muneca adelante;
+    // probado 2026-10-31: hacia el pulgar bajo 180 ohm en la calibracion y
+    // nada en la prueba). Que baje solo lleva el servo de adelante a derecha.
+    arrastre6 = max(0.0f, t * muneca.cambio[lado][M6]);
+    s = lado == POSTURA_MENIQUE ? t : -t;
+    break;
+  }
+  // 2) Adelante, con el flex 6 sin lo que le sube por el costado
+  f = (x[M6] - arrastre6) / muneca.cambio[POSTURA_ADELANTE][M6];
+}
+
+// Muneca compensada: angulos del servo de adelante y del lateral a partir de
+// R6, R7 y R8 juntos
+void calcularMuneca(const float r[3], float &angulo6, float &angulo7) {
+  float x[3], f, s;
+  for (int k = 0; k < 3; k++) x[k] = r[k] - muneca.centro[k];
+  posturaMuneca(x, f, s);
+
+  // Si R6 baja (por ejemplo, al cerrar el puno el guante tira del flex) f da
+  // negativo: se toma como muneca derecha
+  const ServoDedo &sa = SERVOS[FLEX_MUNECA_ADELANTE], &sl = SERVOS[FLEX_MUNECA_LATERAL];
   f = constrain(f, 0.0f, 1.0f);
   angulo6 = sa.anguloPlano + aplicarZonaCentro(f, ZONA_CENTRO_ADELANTE) * (sa.anguloDoblado - sa.anguloPlano);
-  float extra = ZONA_LATERAL_EXTRA_ADELANTE * f;   // muneca hacia adelante: costado menos sensible
-  if (s >= 0) {
-    float zona = ZONA_CENTRO + (1.0f - ZONA_CENTRO) * extra;
-    float t = aplicarZonaCentro(constrain(s, 0.0f, 1.0f), zona);
-    angulo7 = sl.anguloPlano + t * (sl.anguloDoblado - sl.anguloPlano);
-  } else {
-    float zona = ZONA_CENTRO_OTRO_LADO + (1.0f - ZONA_CENTRO_OTRO_LADO) * extra;
-    float t = aplicarZonaCentro(constrain(-s, 0.0f, 1.0f), zona);
-    angulo7 = sl.anguloPlano + t * (sl.anguloOtroLado - sl.anguloPlano);
-  }
+  // Muneca hacia adelante: costado menos sensible
+  float zona = ZONA_CENTRO_COSTADO + (1.0f - ZONA_CENTRO_COSTADO) * ZONA_LATERAL_EXTRA_ADELANTE * f;
+  float t = aplicarZonaCentro(constrain(fabsf(s), 0.0f, 1.0f), zona);
+  angulo7 = sl.anguloPlano + t * ((s >= 0 ? sl.anguloDoblado : sl.anguloOtroLado) - sl.anguloPlano);
 }
 
 // Barrido lento de un servo entre dos angulos
@@ -693,17 +748,36 @@ void guardarCalibracion() {
   memoria.putBytes("rPlano", rPlano, sizeof(rPlano));
   memoria.putBytes("rDoblado", rDoblado, sizeof(rDoblado));
   memoria.putBytes("rOtroLado", rOtroLado, sizeof(rOtroLado));
-  if (USAR_COMPENSACION_MUNECA) {   // apagada: no se pisa la compensacion guardada
-    memoria.putBytes("acople", &acople, sizeof(acople));
-    memoria.putBool("acopleOk", acopleCalibrado);
-  }
   calibracionGuardada = true;
   canalesGuardados = CANT_CANALES;
 }
 
-// Flex de la muneca con la compensacion calibrada (se manejan juntos)
+// La calibracion de muneca se guarda aparte (la de antes, de 2 flex, estaba
+// en "acople" y ya no se usa)
+void guardarMuneca() {
+  memoria.putBytes("muneca", &muneca, sizeof(muneca));
+  memoria.putBool("munecaOk", munecaCalibrada);
+}
+
+// Canales de la muneca con la compensacion calibrada (se manejan juntos)
 bool esMunecaCompensada(int i) {
-  return acopleCalibrado && (i == FLEX_MUNECA_ADELANTE || i == FLEX_MUNECA_LATERAL);
+  return munecaCalibrada && (i == FLEX_MUNECA_ADELANTE || i == FLEX_MUNECA_LATERAL);
+}
+
+// Vuelve a tomar el centro de la muneca compensada (los flex no vuelven
+// siempre al mismo valor; cuanto cambian en cada postura si se mantiene).
+// Si la muneca parece doblada, deja el centro guardado.
+bool recentrarMuneca(const float medido[3]) {
+  float x[3], f, s;
+  for (int k = 0; k < 3; k++) x[k] = medido[k] - muneca.centro[k];
+  posturaMuneca(x, f, s);
+  if (f > 0.5f || fabsf(s) > 0.5f) {
+    Serial.printf(">>> La muneca parece doblada (adelante %.0f%%, costado %+.0f%%): se deja el centro guardado\n",
+                  100 * f, 100 * s);
+    return false;
+  }
+  for (int k = 0; k < 3; k++) muneca.centro[k] = medido[k];
+  return true;
 }
 
 // Mueve el centro de un flex sin cambiar cuanto cambia en cada postura
@@ -758,15 +832,37 @@ void cargarCalibracion() {
     if (canalesGuardados < CANT_CANALES)
       Serial.printf("Calibracion guardada de %d canales: los canales %d a %d estan SIN CALIBRAR (hacer c)\n",
                     canalesGuardados, canalesGuardados + 1, CANT_CANALES);
-    if (USAR_COMPENSACION_MUNECA && memoria.getBool("acopleOk", false) &&
-        memoria.getBytesLength("acople") == sizeof(acople)) {
-      memoria.getBytes("acople", &acople, sizeof(acople));
-      acopleCalibrado = true;
-    }
   }
   Serial.println(ok ? "Calibracion cargada de la memoria." : "Sin calibracion guardada: valores por defecto.");
-  if (USAR_COMPENSACION_MUNECA && ok && !acopleCalibrado)
-    Serial.println("Muneca sin compensar: hacer la calibracion de muneca (m).");
+
+  if (memoria.getBool("munecaOk", false) && memoria.isKey("muneca") &&
+      memoria.getBytesLength("muneca") == sizeof(muneca)) {
+    memoria.getBytes("muneca", &muneca, sizeof(muneca));
+    munecaCalibrada = true;
+  } else {
+    Serial.println("Muneca sin compensar (flex 6, 7 y 8): hacer la calibracion de muneca (m) con el guante puesto.");
+  }
+}
+
+void imprimirMuneca() {
+  if (!munecaCalibrada) {
+    Serial.println(">>> Muneca SIN compensar: cada flex mueve su servo (flex 7 pre-curvado: menique / centro / pulgar;"
+                   " el flex 8 no se usa). Calibrar con m.");
+    return;
+  }
+  const ServoDedo &sl = SERVOS[FLEX_MUNECA_LATERAL];
+  Serial.println(">>> Muneca compensada (comando m), en ohm:        R6      R7      R8");
+  Serial.printf(">>>   centro                                  %6.0f  %6.0f  %6.0f\n",
+                muneca.centro[M6], muneca.centro[M7], muneca.centro[M8]);
+  const char *nombres[] = {"", "adelante", "costado menique", "costado pulgar"};
+  for (int k = POSTURA_ADELANTE; k < CANT_POSTURAS; k++) {
+    Serial.printf(">>>   %-16s (cambio)               %+6.0f  %+6.0f  %+6.0f", nombres[k],
+                  muneca.cambio[k][M6], muneca.cambio[k][M7], muneca.cambio[k][M8]);
+    if (k == POSTURA_ADELANTE) Serial.printf("   -> S11 a %d gr", SERVOS[FLEX_MUNECA_ADELANTE].anguloDoblado);
+    else if (!costadoValido(muneca, k)) Serial.print("   -> NO SE USA (no se distingue de adelante)");
+    else Serial.printf("   -> S12 a %d gr", k == POSTURA_MENIQUE ? sl.anguloDoblado : sl.anguloOtroLado);
+    Serial.println();
+  }
 }
 
 void imprimirCalibracion() {
@@ -779,28 +875,37 @@ void imprimirCalibracion() {
                   (unsigned long)rDoblado[i], s.anguloDoblado);
     if (esBidireccional(i))
       Serial.printf("     %6lu -> %3d", (unsigned long)rOtroLado[i], s.anguloOtroLado);
-    if (rPlano[i] == rDoblado[i]) Serial.print("     (SIN CALIBRAR: servo quieto)");
+    if (esMunecaCompensada(i)) Serial.print("     (no se usa: muneca compensada, ver abajo)");
+    else if (rPlano[i] == rDoblado[i]) Serial.print("     (SIN CALIBRAR: servo quieto)");
     Serial.println();
   }
-  if (acopleCalibrado)
-    Serial.printf(">>> Muneca compensada: adelante mueve R7 %+ld | costados mueven R6 %+ld / %+ld ohm\n",
-                  (long)acople.r7Adelante, (long)acople.r6Lado, (long)acople.r6OtroLado);
-  else if (USAR_COMPENSACION_MUNECA)
-    Serial.println(">>> Muneca SIN compensar (los flex 6 y 7 se arrastran): usar el comando m");
-  else
-    Serial.println(">>> Muneca: cada flex mueve su servo (flex 7 pre-curvado: menique / centro / pulgar)");
+  imprimirMuneca();
 }
 
 void imprimirEncabezado() {
   Serial.print("RECIBIDO    tiempo     seq |");
-  for (int i = 0; i < CANT_CANALES; i++) Serial.printf(" %5s", SERVOS[i].etiqueta);
+  for (int i = 0; i < CANT_CANALES; i++) {
+    Serial.printf(" %5s", SERVOS[i].etiqueta);
+    if (i == FLEX_MUNECA_LATERAL) Serial.print("    F8");   // flex 8: sin servo, despues del 7
+  }
   Serial.print(" |");
   for (int i = 0; i < CANT_CANALES; i++) Serial.printf(" A%-2d", i + 1);
   Serial.println(" (gr) | perdidos");
 }
 
+// Promedio de R6, R7 y R8 juntado en calSumaMuneca
+void promedioMuneca(float medido[3]) {
+  for (int k = 0; k < 3; k++) medido[k] = (float)calSumaMuneca[k] / calCant;
+}
+
 void terminarCalibracionInicio() {
+  if (munecaCalibrada) {
+    float medido[3];
+    promedioMuneca(medido);
+    recentrarMuneca(medido);
+  }
   for (int i = 0; i < CANT_CANALES; i++) {
+    if (esMunecaCompensada(i)) continue;   // ya se tomo el centro de la muneca
     uint32_t medido = calSuma[i] / calCant;
     // Nunca se calibro: estirado medido; flex = estirado + rango tipico,
     // potenciometro = sin movimiento hasta calibrarlo con c
@@ -841,6 +946,7 @@ void iniciarCalibracionGuiada() {
   calInicio = calUltimoAviso = millis();
   calCant = 0;
   for (int i = 0; i < CANT_CANALES; i++) calSuma[i] = 0;
+  for (int k = 0; k < 3; k++) calSumaMuneca[k] = 0;
   // Las indicaciones "CALIBRACION n/3: ..." las lee en voz alta el script de calibracion
   Serial.println("\n>>> CALIBRACION 1/3: Mano abierta, dedos estirados y juntos, muneca derecha. Quieta.");
 }
@@ -877,13 +983,20 @@ void avanzarCalibracionGuiada() {
     Serial.println(">>> CALIBRACION 3/3: Abrir la mano y separar los dedos hacia los costados, al maximo.");
   } else if (calEstado == CAL_SEPARAR && ahora - calInicio >= CAL_SEPARAR_MS) {
     calEstado = CAL_NO;
+    // Muneca compensada: de la fase 1 (muneca derecha) solo se toma el centro;
+    // cuanto cambia en cada postura se calibra con m
+    if (munecaCalibrada) {
+      float medido[3];
+      promedioMuneca(medido);
+      if (recentrarMuneca(medido)) {
+        guardarMuneca();
+        Serial.println(">>> Muneca: se volvio a tomar el centro (lo demas se calibra con m)");
+      }
+    }
     for (int i = 0; i < CANT_CANALES; i++) {
       uint32_t plano = calSuma[i] / calCant;
       float rango = calMax[i] - plano;
-      if (esMunecaCompensada(i)) {
-        Serial.printf(">>> Flex %d (muneca): se calibra aparte con el comando m\n", i + 1);
-        continue;
-      }
+      if (esMunecaCompensada(i)) continue;
       if (SERVOS[i].tipoSensor == SENSOR_POT) {
         calibrarPotenciometro(i, plano);
         continue;
@@ -927,7 +1040,10 @@ void avisarFaseMuneca() {
 
 void iniciarCalibracionMuneca() {
   if (!hayDatos || calibrandoInicio) { Serial.println(">>> Sin datos del guante: no se puede calibrar"); return; }
-  for (int k = 0; k < CANT_POSTURAS; k++) munSuma6[k] = munSuma7[k] = munCant[k] = 0;
+  for (int k = 0; k < CANT_POSTURAS; k++) {
+    for (int j = 0; j < 3; j++) munSuma[k][j] = 0;
+    munCant[k] = 0;
+  }
   faseMuneca = 0;
   calEstado = CAL_MUNECA;
   calInicio = millis();
@@ -939,72 +1055,77 @@ void iniciarCalibracionMuneca() {
 void juntarDatosMuneca(const PaqueteGuante &p) {
   if (millis() - calInicio < CAL_DESCARTE_MS) return;
   uint8_t k = FASES_MUNECA[faseMuneca].postura;
-  munSuma6[k] += p.resistencia[FLEX_MUNECA_ADELANTE];
-  munSuma7[k] += p.resistencia[FLEX_MUNECA_LATERAL];
+  for (int j = 0; j < 3; j++) munSuma[k][j] += p.resistencia[FLEX_MUNECA[j]];
   munCant[k]++;
 }
 
 void terminarCalibracionMuneca() {
-  const int A = FLEX_MUNECA_ADELANTE, L = FLEX_MUNECA_LATERAL;
   calEstado = CAL_NO;
   for (int k = 0; k < CANT_POSTURAS; k++)
     if (munCant[k] == 0) { Serial.println(">>> Sin datos: calibracion de muneca cancelada"); return; }
 
   // Promedio de cada postura (el centro promedia todas las vueltas al centro:
   // el flex no vuelve siempre al mismo valor)
-  float c6 = munSuma6[POSTURA_CENTRO] / munCant[POSTURA_CENTRO];
-  float c7 = munSuma7[POSTURA_CENTRO] / munCant[POSTURA_CENTRO];
-  float d6[CANT_POSTURAS], d7[CANT_POSTURAS];   // cambio respecto del centro
-  for (int k = 0; k < CANT_POSTURAS; k++) {
-    d6[k] = munSuma6[k] / munCant[k] - c6;
-    d7[k] = munSuma7[k] / munCant[k] - c7;
-  }
-  Serial.println(">>> Cambio respecto del centro (ohm):    R6      R7");
+  CalMuneca nueva = {};
+  for (int j = 0; j < 3; j++) nueva.centro[j] = munSuma[POSTURA_CENTRO][j] / munCant[POSTURA_CENTRO];
+  for (int k = POSTURA_ADELANTE; k < CANT_POSTURAS; k++)
+    for (int j = 0; j < 3; j++) nueva.cambio[k][j] = munSuma[k][j] / munCant[k] - nueva.centro[j];
+
   const char *nombres[] = {"centro", "adelante", "menique", "pulgar"};
-  for (int k = 1; k < CANT_POSTURAS; k++)
-    Serial.printf(">>>   %-10s                       %+6.0f  %+6.0f\n", nombres[k], d6[k], d7[k]);
+  Serial.println(">>> Muneca, en ohm:                       R6      R7      R8");
+  Serial.printf(">>>   centro                           %6.0f  %6.0f  %6.0f\n",
+                nueva.centro[M6], nueva.centro[M7], nueva.centro[M8]);
+  for (int k = POSTURA_ADELANTE; k < CANT_POSTURAS; k++)
+    Serial.printf(">>>   %-10s (cambio)              %+6.0f  %+6.0f  %+6.0f\n", nombres[k],
+                  nueva.cambio[k][M6], nueva.cambio[k][M7], nueva.cambio[k][M8]);
 
-  // El lado "doblado" del flex 7 es donde SUBE R7 (no importa si es menique o pulgar)
-  int lado = d7[POSTURA_LADO1] >= d7[POSTURA_LADO2] ? POSTURA_LADO1 : POSTURA_LADO2;
-  int otro = lado == POSTURA_LADO1 ? POSTURA_LADO2 : POSTURA_LADO1;
+  // El servo llega al final un poco antes del maximo medido (igual que en la
+  // calibracion guiada)
+  for (int k = POSTURA_ADELANTE; k < CANT_POSTURAS; k++)
+    for (int j = 0; j < 3; j++) nueva.cambio[k][j] *= 1.0f - MARGEN_DOBLADO;
 
-  if (d6[POSTURA_ADELANTE] < 2 * RANGO_MINIMO) {
-    Serial.printf(">>> El flex 6 casi no cambio hacia adelante (%.0f ohm): calibracion cancelada\n", d6[POSTURA_ADELANTE]);
-    return;
-  }
-  if (d7[lado] < 2 * RANGO_MINIMO) {
-    Serial.printf(">>> El flex 7 casi no cambio hacia los costados (%.0f ohm): calibracion cancelada\n", d7[lado]);
-    return;
-  }
-  float det = d6[POSTURA_ADELANTE] * d7[lado] - d6[lado] * d7[POSTURA_ADELANTE];
-  if (det < 0.2f * d6[POSTURA_ADELANTE] * d7[lado]) {
-    Serial.println(">>> Adelante y costado mueven los dos flex casi igual: no se pueden separar.");
-    Serial.println(">>> Revisar la colocacion de los flex 6 y 7. Calibracion cancelada.");
+  // Adelante tiene que mover bien el flex 6
+  if (nueva.cambio[POSTURA_ADELANTE][M6] < 2 * RANGO_MINIMO) {
+    Serial.printf(">>> El flex 6 casi no cambio hacia adelante (%+.0f ohm): calibracion cancelada\n",
+                  nueva.cambio[POSTURA_ADELANTE][M6]);
     return;
   }
 
-  // El doblado queda un poco antes del maximo (igual que en la calibracion guiada)
-  float m = 1.0f - MARGEN_DOBLADO;
-  rPlano[A] = (uint32_t)c6;
-  rPlano[L] = (uint32_t)c7;
-  rDoblado[A] = (uint32_t)(c6 + m * d6[POSTURA_ADELANTE]);
-  rDoblado[L] = (uint32_t)(c7 + m * d7[lado]);
-  acople.r7Adelante = (int32_t)(m * d7[POSTURA_ADELANTE]);
-  acople.r6Lado = (int32_t)(m * d6[lado]);
-  if (-d7[otro] >= RANGO_MINIMO_OTRO_LADO) {
-    rOtroLado[L] = (uint32_t)(c7 + m * d7[otro]);
-    acople.r6OtroLado = (int32_t)(m * d6[otro]);
-  } else {
-    Serial.printf(">>> Hacia el %s el flex 7 casi no cambio (%+.0f ohm): ese lado queda con el valor por defecto\n",
-                  nombres[otro], d7[otro]);
-    rOtroLado[L] = otroLadoInicial(rPlano[L]);
-    acople.r6OtroLado = 0;
+  // Cada costado tiene que mover los flex 7 y 8 distinto que adelante
+  float p7, p8;
+  proporcionAdelante(nueva, p7, p8);
+  Serial.printf(">>> Hacia adelante los flex 7 y 8 cambian en proporcion %.2f : %.2f%s\n", p7, p8,
+                hypotf(nueva.cambio[POSTURA_ADELANTE][M7], nueva.cambio[POSTURA_ADELANTE][M8]) < RANGO_MINIMO_COSTADO
+                    ? " (casi no cambian: se toma 1 : 1)" : "");
+  float desvio[CANT_POSTURAS];
+  int validos = 0;
+  for (int k = POSTURA_MENIQUE; k <= POSTURA_PULGAR; k++) {
+    float l7 = nueva.cambio[k][M7], l8 = nueva.cambio[k][M8];
+    float largo = hypotf(l7, l8);
+    desvio[k] = desvioCostado(nueva, l7, l8);
+    bool ok = costadoValido(nueva, k);
+    validos += ok;
+    Serial.printf(">>> Costado del %-8s: flex 7 y 8 cambian %4.0f ohm, distinto de adelante en %3.0f%% -> %s\n",
+                  nombres[k], largo, largo > 0 ? 100 * fabsf(desvio[k]) / largo : 0.0f,
+                  ok ? "OK" : largo < RANGO_MINIMO_COSTADO ? "NO SE USA (casi no cambian)"
+                                                            : "NO SE USA (parece adelante)");
   }
-  Serial.printf(">>> El flex 7 sube hacia el %s: ese lado va a %d gr, el otro a %d gr (si queda al reves: a7 %d %d %d)\n",
-                nombres[lado], SERVOS[L].anguloDoblado, SERVOS[L].anguloOtroLado,
-                SERVOS[L].anguloPlano, SERVOS[L].anguloOtroLado, SERVOS[L].anguloDoblado);
-  acopleCalibrado = true;
-  guardarCalibracion();
+  if (validos == 0) {
+    Serial.println(">>> Ningun costado se distingue de adelante con los flex 7 y 8.");
+    Serial.println(">>> Revisar la colocacion de los flex 7 y 8. Calibracion cancelada.");
+    return;
+  }
+  if (validos == 2 && desvio[POSTURA_MENIQUE] * desvio[POSTURA_PULGAR] > 0) {
+    Serial.println(">>> Los dos costados mueven los flex 7 y 8 hacia el mismo lado: no se pueden distinguir.");
+    Serial.println(">>> Revisar la colocacion de los flex 7 y 8. Calibracion cancelada.");
+    return;
+  }
+  if (validos == 1)
+    Serial.println(">>> ATENCION: el servo lateral solo va a ir hacia un costado (el otro NO SE USA)");
+
+  muneca = nueva;
+  munecaCalibrada = true;
+  guardarMuneca();
   Serial.println(">>> Calibracion de muneca terminada y guardada.");
   imprimirCalibracion();
   imprimirEncabezado();
@@ -1046,10 +1167,17 @@ void procesar(const Recepcion &r) {
     ultimaR[i] = valor[i];
     rFiltrada[i] = rFiltrada[i] < 0 ? valor[i] : rFiltrada[i] + ALPHA * (valor[i] - rFiltrada[i]);
   }
+  float rMuneca[3];
+  for (int k = 0; k < 3; k++) {
+    rMuneca[k] = p.resistencia[FLEX_MUNECA[k]];
+    rFiltradaMuneca[k] = rFiltradaMuneca[k] < 0 ? rMuneca[k]
+                                                : rFiltradaMuneca[k] + ALPHA * (rMuneca[k] - rFiltradaMuneca[k]);
+  }
 
   // Calibracion del estirado con los primeros paquetes
   if (calibrandoInicio) {
     for (int i = 0; i < CANT_CANALES; i++) calSuma[i] += valor[i];
+    for (int k = 0; k < 3; k++) calSumaMuneca[k] += rMuneca[k];
     if (++calCant >= PAQUETES_CALIBRACION) terminarCalibracionInicio();
     return;
   }
@@ -1059,6 +1187,7 @@ void procesar(const Recepcion &r) {
   // apertura lateral se mide aparte (fase SEPARAR) y no mientras se cierra.
   if (calEstado == CAL_ABIERTA) {
     for (int i = 0; i < CANT_CANALES; i++) calSuma[i] += valor[i];
+    for (int k = 0; k < 3; k++) calSumaMuneca[k] += rMuneca[k];
     calCant++;
   } else if (calEstado == CAL_CERRADA || calEstado == CAL_SEPARAR) {
     for (int i = 0; i < CANT_CANALES; i++) {
@@ -1076,9 +1205,9 @@ void procesar(const Recepcion &r) {
     if (esMunecaCompensada(i)) continue;
     fijarObjetivo(i, calcularAngulo(i, rFiltrada[i]));
   }
-  if (acopleCalibrado) {
+  if (munecaCalibrada) {
     float a6, a7;
-    calcularMuneca(rFiltrada[FLEX_MUNECA_ADELANTE], rFiltrada[FLEX_MUNECA_LATERAL], a6, a7);
+    calcularMuneca(rFiltradaMuneca, a6, a7);
     fijarObjetivo(FLEX_MUNECA_ADELANTE, a6);
     fijarObjetivo(FLEX_MUNECA_LATERAL, a7);
   }
@@ -1101,7 +1230,10 @@ void procesar(const Recepcion &r) {
   if (p.seq % HISTORIAL_CADA_N == 0 && calEstado == CAL_NO) {
     if (p.seq % (HISTORIAL_CADA_N * 40) == 0) imprimirEncabezado();
     Serial.printf("RECIBIDO %8.2f s  #%6lu |", r.t_rx_ms / 1000.0, (unsigned long)p.seq);
-    for (int i = 0; i < CANT_CANALES; i++) Serial.printf(" %5ld", lroundf(valor[i]));
+    for (int i = 0; i < CANT_CANALES; i++) {
+      Serial.printf(" %5ld", lroundf(valor[i]));
+      if (i == FLEX_MUNECA_LATERAL) Serial.printf(" %5ld", lroundf(rMuneca[M8]));   // flex 8
+    }
     Serial.print(" |");
     for (int i = 0; i < CANT_CANALES; i++) Serial.printf(" %3d", (int)lroundf(anguloServo[i]));
     Serial.printf("      | %6lu", (unsigned long)perdidos);
@@ -1142,15 +1274,20 @@ void ejecutarComando(char *linea) {
 
   if (c == 'p' || c == 'd') {
     if (!hayDatos) { Serial.println(">>> Sin datos del guante"); return; }
+    bool centrarMuneca = false;
     for (int i = desde; i < hasta; i++) {
       if (esMunecaCompensada(i)) {
-        // Muneca compensada: p corre el centro, el doblado se calibra con m
-        if (c == 'p') moverCentro(i, (uint32_t)rFiltrada[i]);
+        // Muneca compensada: p toma el centro de los 3 flex, el doblado se calibra con m
+        if (c == 'p') centrarMuneca = true;
         else if (n) Serial.printf(">>> Flex %d (muneca): el doblado se calibra con el comando m\n", i + 1);
         continue;
       }
       (c == 'p' ? rPlano : rDoblado)[i] = (uint32_t)rFiltrada[i];
       if (esBidireccional(i) && !otroLadoValido(i)) rOtroLado[i] = otroLadoInicial(rPlano[i]);
+    }
+    if (centrarMuneca) {
+      for (int k = 0; k < 3; k++) muneca.centro[k] = rFiltradaMuneca[k];
+      guardarMuneca();
     }
     guardarCalibracion();
     imprimirCalibracion();
@@ -1185,17 +1322,19 @@ void ejecutarComando(char *linea) {
       irAHome(true);
     }
   } else if (c == 'm') {
-    if (USAR_COMPENSACION_MUNECA) iniciarCalibracionMuneca();
-    else Serial.println(">>> Compensacion de muneca apagada (USAR_COMPENSACION_MUNECA 0): calibrar con c");
+    iniciarCalibracionMuneca();
   } else if (c == 'x') {
-    acopleCalibrado = false;   // vuelve a mover cada flex de la muneca por separado
-    guardarCalibracion();
+    munecaCalibrada = false;   // vuelve a mover cada flex de la muneca por separado
+    guardarMuneca();
     imprimirCalibracion();
   } else if (c == 's') {
     imprimirCalibracion();
     Serial.printf(">>> Recibidos %lu  perdidos %lu  largo distinto %lu\n", (unsigned long)recibidos,
                   (unsigned long)perdidos, (unsigned long)largoDistinto);
     comandoTension("");
+    Wire.beginTransmission(0x40);
+    Serial.println(Wire.endTransmission() == 0 ? ">>> PCA9685: responde por I2C (0x40)"
+                                               : ">>> PCA9685: NO RESPONDE por I2C: revisar SDA (GPIO21), SCL (GPIO22), VCC y GND del PCA9685");
   } else if (c == 't' && n) {
     probarServo(n - 1);
   } else if (c == 'a' && n) {
@@ -1250,7 +1389,7 @@ void setup() {
                            "BROWNOUT", "SDIO"};
   esp_reset_reason_t motivo = esp_reset_reason();
   Serial.printf("\nMotivo del reinicio: %s\n", motivo <= ESP_RST_SDIO ? motivos[motivo] : "?");
-  Serial.println("\n=== MANO ROBOT: 7 FLEX + 8 POTENCIOMETROS -> 15 SERVOS (ESP32 + PCA9685) ===");
+  Serial.println("\n=== MANO ROBOT: 8 FLEX + 9 POTENCIOMETROS -> 16 SERVOS (ESP32 + PCA9685) ===");
 
   memoria.begin("mano", false);
   cargarCalibracion();
@@ -1269,6 +1408,9 @@ void setup() {
 
   Wire.begin(I2C_SDA, I2C_SCL);
   pca.begin();
+  Wire.beginTransmission(0x40);
+  if (Wire.endTransmission() != 0)
+    Serial.println("ATENCION: el PCA9685 NO RESPONDE por I2C: revisar SDA (GPIO21), SCL (GPIO22), VCC y GND");
   pca.setPWMFreq(50);
   delay(10);
 
@@ -1282,6 +1424,7 @@ void setup() {
   // Lleva los servos a HOME de a uno (sin pico de corriente). El servo no
   // informa donde esta, asi que este primer movimiento es a su velocidad maxima;
   // los siguientes (h, sin senal) van despacio a VELOCIDAD_HOME
+  for (int k = 0; k < 3; k++) rFiltradaMuneca[k] = -1;
   for (int i = 0; i < CANT_CANALES; i++) {
     rFiltrada[i] = -1;
     anguloServo[i] = SERVOS[i].anguloHome;
@@ -1297,7 +1440,7 @@ void setup() {
 
   Serial.printf("Mi MAC: %s  Canal: %d\n", WiFi.macAddress().c_str(), CANAL_ESPNOW);
   Serial.println("Comandos: c = calibracion guiada | p/d = estirado/doblado actual (p3 = solo canal 3, de 1 a 16)");
-  Serial.println("          m = calibracion de muneca (flex 6 y 7 juntos) | x = quitar compensacion de muneca");
+  Serial.println("          m = calibracion de muneca (flex 6, 7 y 8 juntos) | x = quitar compensacion de muneca");
   Serial.println("          o7 = otro lado actual de la muneca | a7 90 170 10 = angulos muneca");
   Serial.println("          s = ver calibracion | t3 = probar servo 3 | a3 10 170 = angulos servo 3 | r = contadores");
   Serial.println("          h = ir a HOME y quedarse (h otra vez = seguir al guante; tambien rearma tras falla de tension)");
