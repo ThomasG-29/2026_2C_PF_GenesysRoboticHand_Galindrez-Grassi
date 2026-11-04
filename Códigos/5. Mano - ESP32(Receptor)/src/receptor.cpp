@@ -185,7 +185,31 @@ bool esBidireccional(int i) { return SERVOS[i].anguloOtroLado != SIN_OTRO_LADO; 
                                    // 0: se queda quieta en la ultima posicion
 
 // Suavizado de la resistencia: mas chico = mas suave pero mas lento
-#define ALPHA 0.4f
+#define ALPHA 0.3f
+
+// Histeresis: el conversor del guante mide de a escalones de ~2 mV y una
+// lectura que queda justo entre dos escalones salta de uno a otro. Con un flex
+// de poco recorrido (~200 ohm entre estirado y doblado) un escalon son 20-30
+// grados y el dedo tiembla quieto. El valor que mueve al servo solo cambia
+// cuando el filtrado se aleja mas de HISTERESIS_ESCALONES escalones.
+#define HISTERESIS_ESCALONES 0.8f
+#define ESCALON_ADS_V 0.002f      // 16 cuentas del ADS a +-4.096 V (ver transmisor)
+#define ESCALON_POT   16.0f       // el mismo escalon, en cuentas
+#define R_FIJA_GUANTE 10000.0f    // divisor de cada flex en el guante
+#define VCC_GUANTE    3.3f
+
+// Cuantos ohm cambia un flex de resistencia r con un escalon del conversor
+float escalonFlex(float r) {
+  return (R_FIJA_GUANTE + r) * (R_FIJA_GUANTE + r) / (R_FIJA_GUANTE * VCC_GUANTE) * ESCALON_ADS_V;
+}
+
+// Sigue al valor medido, pero solo cuando se aleja mas que la banda
+float aplicarHisteresis(float anterior, float medido, float banda) {
+  if (anterior < 0) return medido;
+  if (medido > anterior + banda) return medido - banda;
+  if (medido < anterior - banda) return medido + banda;
+  return anterior;
+}
 
 #define I2C_SDA 21
 #define I2C_SCL 22
@@ -336,6 +360,8 @@ int canalesGuardados = 0;          // canales con calibracion en la memoria (una
 bool modoAjuste = false;           // comando w: muestra solo los potenciometros
 float rFiltrada[CANT_CANALES];
 float rFiltradaMuneca[3];            // R6, R7, R8 filtradas (el flex 8 no es un canal)
+float rEstable[CANT_CANALES];        // filtradas + histeresis: las que mueven los servos
+float rEstableMuneca[3];
 float anguloServo[CANT_CANALES];     // angulo que tiene cada servo ahora
 float objetivoServo[CANT_CANALES];   // angulo al que tiene que ir (segun el guante)
 bool hayObjetivo = false;
@@ -1166,12 +1192,16 @@ void procesar(const Recepcion &r) {
     valor[i] = valorCanal(p, i);
     ultimaR[i] = valor[i];
     rFiltrada[i] = rFiltrada[i] < 0 ? valor[i] : rFiltrada[i] + ALPHA * (valor[i] - rFiltrada[i]);
+    float escalon = SERVOS[i].tipoSensor == SENSOR_FLEX ? escalonFlex(rFiltrada[i]) : ESCALON_POT;
+    rEstable[i] = aplicarHisteresis(rEstable[i], rFiltrada[i], HISTERESIS_ESCALONES * escalon);
   }
   float rMuneca[3];
   for (int k = 0; k < 3; k++) {
     rMuneca[k] = p.resistencia[FLEX_MUNECA[k]];
     rFiltradaMuneca[k] = rFiltradaMuneca[k] < 0 ? rMuneca[k]
                                                 : rFiltradaMuneca[k] + ALPHA * (rMuneca[k] - rFiltradaMuneca[k]);
+    rEstableMuneca[k] = aplicarHisteresis(rEstableMuneca[k], rFiltradaMuneca[k],
+                                          HISTERESIS_ESCALONES * escalonFlex(rFiltradaMuneca[k]));
   }
 
   // Calibracion del estirado con los primeros paquetes
@@ -1203,11 +1233,11 @@ void procesar(const Recepcion &r) {
   // salir de HOME el servo vaya directo a donde esta el guante)
   for (int i = 0; i < CANT_CANALES; i++) {
     if (esMunecaCompensada(i)) continue;
-    fijarObjetivo(i, calcularAngulo(i, rFiltrada[i]));
+    fijarObjetivo(i, calcularAngulo(i, rEstable[i]));
   }
   if (munecaCalibrada) {
     float a6, a7;
-    calcularMuneca(rFiltradaMuneca, a6, a7);
+    calcularMuneca(rEstableMuneca, a6, a7);
     fijarObjetivo(FLEX_MUNECA_ADELANTE, a6);
     fijarObjetivo(FLEX_MUNECA_LATERAL, a7);
   }
@@ -1424,9 +1454,9 @@ void setup() {
   // Lleva los servos a HOME de a uno (sin pico de corriente). El servo no
   // informa donde esta, asi que este primer movimiento es a su velocidad maxima;
   // los siguientes (h, sin senal) van despacio a VELOCIDAD_HOME
-  for (int k = 0; k < 3; k++) rFiltradaMuneca[k] = -1;
+  for (int k = 0; k < 3; k++) rFiltradaMuneca[k] = rEstableMuneca[k] = -1;
   for (int i = 0; i < CANT_CANALES; i++) {
-    rFiltrada[i] = -1;
+    rFiltrada[i] = rEstable[i] = -1;
     anguloServo[i] = SERVOS[i].anguloHome;
     escribirServo(i, anguloServo[i]);
     delay(150);

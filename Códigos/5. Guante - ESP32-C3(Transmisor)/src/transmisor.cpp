@@ -5,7 +5,8 @@
 // manda todo por ESP-NOW al receptor (mano robot).
 //
 // Conexionado igual que Conexionado_guante-v3:
-//   Flex 1           -> multiplexor 2, canal 0      -> A1 del ADS1115
+//   Flex 1           -> multiplexor 1, canal 13     -> A0 del ADS1115
+//                       (antes en mux2 C0; se movio porque ese mux quedo danado)
 //   Flex 2 al 7      -> multiplexor 1, canales 1-6  -> A0 del ADS1115
 //   Flex 8           -> multiplexor 1, canal 12     -> A0 (costado del pulgar de la muneca)
 //   Pot. base (x5)   -> multiplexor 1, canales 7-11 -> A0 (pulgar ... menique)
@@ -58,7 +59,7 @@ typedef struct {
 } SensorFlex;
 
 const SensorFlex FLEX[CANT_FLEX] = {
-  {0, ADS_CANAL_MUX2},   // Flex 1
+  {13, ADS_CANAL_MUX1},  // Flex 1
   {1, ADS_CANAL_MUX1},   // Flex 2
   {2, ADS_CANAL_MUX1},   // Flex 3
   {3, ADS_CANAL_MUX1},   // Flex 4
