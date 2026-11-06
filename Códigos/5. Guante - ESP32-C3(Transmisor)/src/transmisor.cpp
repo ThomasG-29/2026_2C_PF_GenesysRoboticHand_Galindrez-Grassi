@@ -5,9 +5,10 @@
 // manda todo por ESP-NOW al receptor (mano robot).
 //
 // Conexionado igual que Conexionado_guante-v3:
-//   Flex 1           -> multiplexor 1, canal 13     -> A0 del ADS1115
-//                       (antes en mux2 C0; se movio porque ese mux quedo danado)
-//   Flex 2 al 7      -> multiplexor 1, canales 1-6  -> A0 del ADS1115
+//   Flex 1           -> multiplexor 1, canal 0      -> A0 del ADS1115
+//                       (antes en mux2 C0; se movio al mux1 cuando se cambiaron los dos mux)
+//   Flex 2, 3, 5-7   -> multiplexor 1, canales 1, 2, 4-6 -> A0 del ADS1115
+//   Flex 4           -> multiplexor 1, canal 13     -> A0 (el C3 tira la senal a GND)
 //   Flex 8           -> multiplexor 1, canal 12     -> A0 (costado del pulgar de la muneca)
 //   Pot. base (x5)   -> multiplexor 1, canales 7-11 -> A0 (pulgar ... menique)
 //   Pot. arriba (x5) -> multiplexor 2, canales 1-5  -> A1 (pulgar ... menique)
@@ -59,10 +60,10 @@ typedef struct {
 } SensorFlex;
 
 const SensorFlex FLEX[CANT_FLEX] = {
-  {13, ADS_CANAL_MUX1},  // Flex 1
+  {0, ADS_CANAL_MUX1},   // Flex 1
   {1, ADS_CANAL_MUX1},   // Flex 2
   {2, ADS_CANAL_MUX1},   // Flex 3
-  {3, ADS_CANAL_MUX1},   // Flex 4
+  {13, ADS_CANAL_MUX1},  // Flex 4 (el C3 de este mux tira la senal a GND)
   {4, ADS_CANAL_MUX1},   // Flex 5
   {5, ADS_CANAL_MUX1},   // Flex 6
   {6, ADS_CANAL_MUX1},   // Flex 7
@@ -95,8 +96,9 @@ Adafruit_ADS1115 ads;
 
 // =====================================================
 // DIVISOR DE TENSION DEL FLEX
-// El flex va entre VCC y la salida, la resistencia fija entre la
-// salida y GND: al doblarlo sube su resistencia y BAJA la lectura.
+// La resistencia fija va entre VCC y la salida y el flex entre la salida
+// y GND (Conexionados/Circuito_guante - v2_bb): V = VCC * R / (R_FIJA + R).
+// Como estan montados en el guante, al doblarlo BAJA su resistencia y la lectura.
 // =====================================================
 #define VCC_DIVISOR 3.3f       // alimentacion del divisor (V)
 #define R_FIJA      10000.0f   // resistencia fija del divisor (ohms)
@@ -141,9 +143,9 @@ int16_t leerFlex(const SensorFlex &s) {
 
 uint32_t calcularResistencia(int16_t adc) {
   float v = ads.computeVolts(adc);
-  if (v <= 0.001f) return 9999999;   // sin tension: circuito abierto
-  float r = R_FIJA * (VCC_DIVISOR - v) / v;
-  return r < 0 ? 0 : (uint32_t)r;
+  if (v >= VCC_DIVISOR - 0.001f) return 9999999;   // salida en VCC: flex abierto (sin GND)
+  if (v <= 0) return 0;                            // salida en GND: flex en corto
+  return (uint32_t)(R_FIJA * v / (VCC_DIVISOR - v));
 }
 
 // Un potenciometro es un divisor de baja impedancia: con una lectura alcanza

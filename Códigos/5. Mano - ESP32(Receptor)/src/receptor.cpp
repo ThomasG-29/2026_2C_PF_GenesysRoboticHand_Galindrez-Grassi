@@ -97,7 +97,7 @@ enum { SENSOR_FLEX, SENSOR_POT };
 typedef struct {
   const char *nombre;
   const char *etiqueta;     // nombre corto del sensor (columnas del historial)
-  uint8_t  tipoSensor;      // SENSOR_FLEX (resistencia en ohm) o SENSOR_POT (cuentas del ADS)
+  uint8_t  tipoSensor;      // SENSOR_FLEX (lectura del flex, ver lecturaFlex) o SENSOR_POT (cuentas del ADS)
   uint8_t  sensor;          // indice en resistencia[] o pot[] del paquete
   uint8_t  canal;           // salida del PCA9685
   uint16_t minUs, maxUs;    // pulso para 0 y 180 grados
@@ -146,10 +146,23 @@ ServoDedo SERVOS[CANT_CANALES] = {
   {"S8 MG90S",   "Amed", SENSOR_POT,  POT_ARRIBA + 2,   7, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 16 nudillo medio (M2 C3)
 };
 
-// Valor del sensor de cada canal en un paquete (ohm para flex, cuentas para potenciometros)
+#define R_FIJA_GUANTE 10000.0f    // divisor de cada flex en el guante (10k arriba, flex abajo)
+#define VCC_GUANTE    3.3f
+
+// LECTURA DEL FLEX: el guante manda la resistencia REAL de cada flex, que BAJA
+// al doblarlo. Todo el receptor (umbrales, calibracion, muneca, otro lado) se
+// armo con la formula vieja del guante, en la que el valor SUBIA al doblar; esa
+// formula daba exactamente R_FIJA^2 / R real (proporcional a la conductancia del
+// flex). Se sigue trabajando con esa lectura: los umbrales y la calibracion
+// guardada siguen valiendo. Los "ohm" de la calibracion son de esta lectura.
+float lecturaFlex(uint32_t r) {
+  return r == 0 ? 9999999.0f : R_FIJA_GUANTE * R_FIJA_GUANTE / (float)r;
+}
+
+// Valor del sensor de cada canal en un paquete (lectura del flex, cuentas para potenciometros)
 float valorCanal(const PaqueteGuante &p, int i) {
   const ServoDedo &s = SERVOS[i];
-  return s.tipoSensor == SENSOR_FLEX ? (float)p.resistencia[s.sensor] : (float)p.pot[s.sensor];
+  return s.tipoSensor == SENSOR_FLEX ? lecturaFlex(p.resistencia[s.sensor]) : (float)p.pot[s.sensor];
 }
 bool esPotBase(int i) { return SERVOS[i].tipoSensor == SENSOR_POT && SERVOS[i].sensor < POT_ARRIBA; }
 
@@ -195,10 +208,8 @@ bool esBidireccional(int i) { return SERVOS[i].anguloOtroLado != SIN_OTRO_LADO; 
 #define HISTERESIS_ESCALONES 0.8f
 #define ESCALON_ADS_V 0.002f      // 16 cuentas del ADS a +-4.096 V (ver transmisor)
 #define ESCALON_POT   16.0f       // el mismo escalon, en cuentas
-#define R_FIJA_GUANTE 10000.0f    // divisor de cada flex en el guante
-#define VCC_GUANTE    3.3f
 
-// Cuantos ohm cambia un flex de resistencia r con un escalon del conversor
+// Cuanto cambia la lectura r de un flex (ver lecturaFlex) con un escalon del conversor
 float escalonFlex(float r) {
   return (R_FIJA_GUANTE + r) * (R_FIJA_GUANTE + r) / (R_FIJA_GUANTE * VCC_GUANTE) * ESCALON_ADS_V;
 }
@@ -892,7 +903,7 @@ void imprimirMuneca() {
 }
 
 void imprimirCalibracion() {
-  Serial.println(">>> Calibracion (flex en ohm, potenciometros en cuentas del ADS):");
+  Serial.println(">>> Calibracion (flex: lectura 10k^2/R, sube al doblar; potenciometros en cuentas del ADS):");
   Serial.println(">>>   canal  sensor  servo       PCA   estirado -> gr    doblado -> gr    otro lado -> gr");
   for (int i = 0; i < CANT_CANALES; i++) {
     const ServoDedo &s = SERVOS[i];
@@ -1081,7 +1092,7 @@ void iniciarCalibracionMuneca() {
 void juntarDatosMuneca(const PaqueteGuante &p) {
   if (millis() - calInicio < CAL_DESCARTE_MS) return;
   uint8_t k = FASES_MUNECA[faseMuneca].postura;
-  for (int j = 0; j < 3; j++) munSuma[k][j] += p.resistencia[FLEX_MUNECA[j]];
+  for (int j = 0; j < 3; j++) munSuma[k][j] += lecturaFlex(p.resistencia[FLEX_MUNECA[j]]);
   munCant[k]++;
 }
 
@@ -1197,7 +1208,7 @@ void procesar(const Recepcion &r) {
   }
   float rMuneca[3];
   for (int k = 0; k < 3; k++) {
-    rMuneca[k] = p.resistencia[FLEX_MUNECA[k]];
+    rMuneca[k] = lecturaFlex(p.resistencia[FLEX_MUNECA[k]]);
     rFiltradaMuneca[k] = rFiltradaMuneca[k] < 0 ? rMuneca[k]
                                                 : rFiltradaMuneca[k] + ALPHA * (rMuneca[k] - rFiltradaMuneca[k]);
     rEstableMuneca[k] = aplicarHisteresis(rEstableMuneca[k], rFiltradaMuneca[k],
