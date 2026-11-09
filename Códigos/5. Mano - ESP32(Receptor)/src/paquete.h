@@ -39,4 +39,12 @@ typedef struct __attribute__((packed)) {
   int16_t  adc[CANT_FLEX];           // lecturas del ADS1115 (filtradas con mediana)
   uint32_t resistencia[CANT_FLEX];   // resistencia de cada flex en ohms
   int16_t  pot[CANT_POT];            // lectura de cada potenciometro (cuentas del ADS, 3.3 V = ~26400)
+  uint16_t bateria_mV;               // tension de la bateria del guante (0 = no se puede medir)
+  uint8_t  bateriaBaja;              // 1: bateria descargada -> la mano va a HOME y no sigue
+                                     // al guante hasta que se cargue (lo decide el transmisor)
+  uint8_t  estadoCarga;              // CARGA_NO / CARGA_CARGANDO / CARGA_LLENA (deducido de la
+                                     // tension: ver CARGA en el transmisor)
 } PaqueteGuante;
+
+// Estado del cargador de la bateria del guante
+enum { CARGA_NO = 0, CARGA_CARGANDO = 1, CARGA_LLENA = 2 };

@@ -63,6 +63,10 @@
 // divisor en GPIO34. Tension critica -> deja de seguir al guante y va a HOME;
 // tension de corte -> apaga los servos. Se rearma con h cuando se recupera.
 //
+// BATERIA DEL GUANTE: el guante mide su bateria y manda bateriaBaja en el
+// paquete. Con la bateria baja la mano va a HOME y no sigue al guante (ni con
+// h) hasta que el guante avisa que se cargo; ahi vuelve a seguirlo sola.
+//
 // HOME: al encender la mano va a la posicion anguloHome de SERVOS[] y se queda
 // ahi hasta que el guante esta conectado y calibrado (ver HOME mas abajo).
 // =====================================================
@@ -392,6 +396,15 @@ bool fallaTension = false;      // tension critica: en HOME hasta rearmar con h
 bool servosApagados = false;    // tension de corte: PWM apagado (servos sueltos)
 bool avisoTension = false;
 
+// Bateria del guante (la decide el transmisor)
+bool bateriaGuanteBaja = false;   // en HOME hasta que el guante avise que se cargo
+uint16_t bateriaGuante_mV = 0;    // 0 = el guante no puede medirla
+uint8_t cargaGuante = CARGA_NO;   // si el guante esta enchufado al cargador
+
+const char *textoCargaGuante() {
+  return cargaGuante == CARGA_CARGANDO ? " cargando" : cargaGuante == CARGA_LLENA ? " llena" : "";
+}
+
 uint32_t recibidos = 0, perdidos = 0, ultimoSeq = 0, tUltimoRx = 0;
 volatile uint32_t largoDistinto = 0;
 bool sinSenalAvisado = false;
@@ -496,8 +509,9 @@ void actualizarHome() {
   }
 
   // Sigue al guante solo si hay senal, ya se calibro el inicio y paso la espera
-  // (con falla de tension se queda en HOME hasta rearmar con h)
-  bool guanteListo = hayDatos && !calibrandoInicio && !sinSenalAvisado;
+  // (con falla de tension se queda en HOME hasta rearmar con h; con la bateria
+  // del guante baja, hasta que el guante avise que se cargo)
+  bool guanteListo = hayDatos && !calibrandoInicio && !sinSenalAvisado && !bateriaGuanteBaja;
   if (!homeManual && !fallaTension && guanteListo && ahora - tEnHome >= ESPERA_HOME_MS) {
     enHome = false;
     Serial.println(">>> Siguiendo al guante");
@@ -1198,6 +1212,27 @@ void procesar(const Recepcion &r) {
     sinSenalAvisado = false;
   }
 
+  // Bateria del guante: baja -> HOME y bloqueo; cargada -> actualizarHome() la libera
+  bateriaGuante_mV = p.bateria_mV;
+  if (p.estadoCarga != cargaGuante) {
+    cargaGuante = p.estadoCarga;
+    Serial.printf(">>> GUANTE: %s (%.2f V)\n",
+                  cargaGuante == CARGA_CARGANDO ? "bateria CARGANDO"
+                  : cargaGuante == CARGA_LLENA  ? "bateria LLENA (cargador enchufado)"
+                                                : "cargador desenchufado",
+                  p.bateria_mV / 1000.0);
+  }
+  if (p.bateriaBaja && !bateriaGuanteBaja) {
+    bateriaGuanteBaja = true;
+    irAHome(false);
+    Serial.printf(">>> BATERIA DEL GUANTE BAJA (%.2f V): la mano va a HOME y queda bloqueada hasta cargar el guante\n",
+                  p.bateria_mV / 1000.0);
+  } else if (!p.bateriaBaja && bateriaGuanteBaja) {
+    bateriaGuanteBaja = false;
+    Serial.printf(">>> BATERIA DEL GUANTE CARGADA (%.2f V): la mano vuelve a seguir al guante\n",
+                  p.bateria_mV / 1000.0);
+  }
+
   float valor[CANT_CANALES];
   for (int i = 0; i < CANT_CANALES; i++) {
     valor[i] = valorCanal(p, i);
@@ -1279,6 +1314,8 @@ void procesar(const Recepcion &r) {
     for (int i = 0; i < CANT_CANALES; i++) Serial.printf(" %3d", (int)lroundf(anguloServo[i]));
     Serial.printf("      | %6lu", (unsigned long)perdidos);
     if (divisorConectado) Serial.printf(" | %4.2f V", tension);
+    if (bateriaGuante_mV) Serial.printf(" | guante %4.2f V%s%s", bateriaGuante_mV / 1000.0,
+                                        bateriaGuanteBaja ? " BAJA" : "", textoCargaGuante());
     Serial.println();
   }
 }
@@ -1353,7 +1390,10 @@ void ejecutarComando(char *linea) {
   } else if (c == 'c') {
     iniciarCalibracionGuiada();
   } else if (c == 'h') {
-    if (fallaTension) {
+    if (bateriaGuanteBaja) {
+      Serial.printf(">>> BATERIA DEL GUANTE BAJA (%.2f V): cargar el guante para volver a mover la mano\n",
+                    bateriaGuante_mV / 1000.0);
+    } else if (fallaTension) {
       // Rearme despues de una falla de tension: vuelve a seguir al guante
       if (rearmarTension()) homeManual = false;
     } else if (homeManual) {
@@ -1373,6 +1413,11 @@ void ejecutarComando(char *linea) {
     Serial.printf(">>> Recibidos %lu  perdidos %lu  largo distinto %lu\n", (unsigned long)recibidos,
                   (unsigned long)perdidos, (unsigned long)largoDistinto);
     comandoTension("");
+    if (bateriaGuante_mV)
+      Serial.printf(">>> BATERIA DEL GUANTE: %.2f V%s%s\n", bateriaGuante_mV / 1000.0, textoCargaGuante(),
+                    bateriaGuanteBaja ? " | BAJA: mano bloqueada en HOME hasta cargar" : "");
+    else
+      Serial.println(">>> BATERIA DEL GUANTE: el guante no la puede medir (o no llego ningun paquete)");
     Wire.beginTransmission(0x40);
     Serial.println(Wire.endTransmission() == 0 ? ">>> PCA9685: responde por I2C (0x40)"
                                                : ">>> PCA9685: NO RESPONDE por I2C: revisar SDA (GPIO21), SCL (GPIO22), VCC y GND del PCA9685");
