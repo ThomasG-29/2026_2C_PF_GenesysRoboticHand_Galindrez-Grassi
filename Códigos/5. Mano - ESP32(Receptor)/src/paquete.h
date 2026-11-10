@@ -44,7 +44,34 @@ typedef struct __attribute__((packed)) {
                                      // al guante hasta que se cargue (lo decide el transmisor)
   uint8_t  estadoCarga;              // CARGA_NO / CARGA_CARGANDO / CARGA_LLENA (deducido de la
                                      // tension: ver CARGA en el transmisor)
+  // Botones del guante (se manda el ESTADO en cada paquete: si se pierde uno no pasa nada)
+  uint8_t  paradaEmergencia;         // 1: boton de parada apretado (con retencion): servos quietos
+  uint8_t  home;                     // 1: HOME pedido con el boton (se apreta otra vez para salir)
+  uint8_t  pedidosCal;               // sube 1 cada vez que se aprieta el boton de calibracion
+                                     // (el receptor calibra cuando cambia, igual que con c)
 } PaqueteGuante;
 
 // Estado del cargador de la bateria del guante
 enum { CARGA_NO = 0, CARGA_CARGANDO = 1, CARGA_LLENA = 2 };
+
+// =====================================================
+// PAQUETE DE VUELTA MANO -> GUANTE (para el LED de calibracion)
+// El receptor lo manda cada 100 ms (y en cuanto empieza o termina una
+// calibracion) a la MAC de la que le llegan los paquetes del guante.
+// =====================================================
+#define TIPO_MANO 6
+
+typedef struct __attribute__((packed)) {
+  uint8_t tipo;         // TIPO_MANO
+  uint8_t calibrando;   // 1: hay una calibracion en curso (boton, c o m)
+  uint8_t patronLed;    // que hacer en la fase actual (patron del LED de calibracion)
+} PaqueteMano;
+
+// Patron del LED de calibracion segun lo que hay que hacer en cada fase
+enum {
+  LED_CAL_NO = 0,       // sin calibracion
+  LED_CAL_QUIETA,       // parpadeo LENTO: mano abierta, muneca derecha, quieta
+  LED_CAL_MOVER,        // parpadeo RAPIDO: hacer el movimiento que sigue (cerrar la mano,
+                        //   muneca adelante / al menique / al pulgar)
+  LED_CAL_SEPARAR,      // DOBLE DESTELLO: abrir y separar los dedos
+};

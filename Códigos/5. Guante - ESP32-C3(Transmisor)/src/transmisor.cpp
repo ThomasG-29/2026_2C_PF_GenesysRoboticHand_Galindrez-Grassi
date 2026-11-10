@@ -29,6 +29,20 @@
 // marca el tester en la bateria (se guarda en la memoria).
 // CARGA: sin cables extra, se deduce si el cargador esta enchufado por como
 // cambia la tension (ver CARGA mas abajo) y se manda a la mano (estadoCarga).
+//
+// BOTONES Y LEDS (ver BOTONES mas abajo):
+//   PARADA (con retencion): apretado = la mano queda quieta donde esta hasta
+//          soltarlo. LED parpadeando mientras esta activa.
+//   HOME   (sin retencion): igual que h en el receptor: la mano va a HOME y se
+//          queda ahi hasta volver a apretarlo. LED fijo mientras esta en HOME.
+//   CAL    (sin retencion): calibracion completa en la mano (c y despues m: dedos
+//          y muneca, ~61 s). LED: fijo al apretar; durante la calibracion
+//          muestra que hacer en cada fase (lo avisa la mano con PaqueteMano):
+//            lento          = mano abierta, muneca derecha, quieta
+//            rapido         = hacer el movimiento que sigue (cerrar la mano;
+//                             muneca adelante / al menique / al pulgar)
+//            doble destello = abrir y separar los dedos
+//          Al terminar queda fijo 2 s y se apaga.
 // =====================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -126,8 +140,8 @@ Adafruit_ADS1115 ads;
 #define ADS_CANAL_BATERIA     2
 #define DIVISOR_BATERIA       ((10000.0f + 10000.0f) / 10000.0f)
 #define BATERIA_AVISO         3.60f   // V: solo avisa por el monitor (queda poca carga)
-#define BATERIA_BAJA          3.30f   // V: la mano va a HOME y se bloquea hasta cargar
-                                      //    (queda ~5 % de carga: margen para que el guante siga
+#define BATERIA_BAJA          3.40f   // V: la mano va a HOME y se bloquea hasta cargar
+                                      //    (queda ~5-10 % de carga: margen para que el guante siga
                                       //    mandando paquetes y la mano se quede en HOME)
 #define BATERIA_CARGADA       3.90f   // V: se desbloquea (hace falta enchufar el cargador:
                                       //    la bateria sola no vuelve a subir tanto)
@@ -175,6 +189,58 @@ float ultimoSalto = 0;          // ultimo salto medido (se ve con el comando b)
 uint32_t tCambioUsb = 0;        // cuando se conecto/desconecto la PC (0 = nunca)
 
 // =====================================================
+// BOTONES Y LEDS
+// Cada boton va entre su GPIO y GND (usa el pull-up interno, sin resistencia).
+// Cada LED: GPIO -> resistencia (220-330 ohm) -> LED -> GND.
+// Si se cablea distinto, cambiar BOTON_APRETADO / LED_ENCENDIDO.
+// GPIO 20 y 21 son el RX/TX de la UART0: como el monitor serie va por el USB
+// nativo no molestan (solo no apretar CAL mientras la placa arranca).
+// =====================================================
+#define PIN_LED_PARADA    0
+#define PIN_BOTON_PARADA  5
+#define PIN_LED_HOME      6
+#define PIN_BOTON_HOME    7
+#define PIN_LED_CAL       20
+#define PIN_BOTON_CAL     21
+
+#define BOTON_APRETADO    LOW    // boton a GND con pull-up interno
+#define LED_ENCENDIDO     HIGH
+
+#define ANTIRREBOTE_MS        30     // el boton tiene que quedar quieto este tiempo
+#define PARPADEO_PARADA_MS    200    // LED de parada: 200 ms prendido / 200 ms apagado
+// LED de calibracion durante la calibracion (el patron lo decide la mano segun la fase):
+#define CAL_LENTO_MS          600    // lento: 600 ms prendido / 600 apagado (mano abierta, quieta)
+#define CAL_RAPIDO_MS         120    // rapido: 120 / 120 (hacer el movimiento que sigue)
+#define CAL_DESTELLO_MS       120    // doble destello: 2 x (120 prendido / 120 apagado) y pausa
+#define CAL_DOBLE_PERIODO_MS  1100   //   (separar los dedos)
+#define CAL_LED_FINAL_MS      2000   // LED fijo al terminar la calibracion
+#define CAL_ESPERA_MANO_MS    1500   // si la mano no empieza a calibrar en este tiempo, se apaga el LED
+#define ESTADO_MANO_TIMEOUT_MS 1000  // sin paquetes de la mano este tiempo = sin respuesta
+
+typedef struct {
+  uint8_t  pin;
+  bool     estable;    // estado ya filtrado (true = apretado)
+  bool     leido;      // ultima lectura
+  uint32_t tCambio;    // cuando cambio la lectura
+} Boton;
+
+Boton botonParada = {PIN_BOTON_PARADA}, botonHome = {PIN_BOTON_HOME}, botonCal = {PIN_BOTON_CAL};
+
+bool paradaEmergencia = false;
+uint32_t tParada = 0;            // cuando se activo la parada (para el parpadeo)
+bool homeGuante = false;
+uint8_t pedidosCal = 0;
+
+// LED de calibracion
+enum { LEDCAL_APAGADO, LEDCAL_ESPERANDO, LEDCAL_CALIBRANDO, LEDCAL_TERMINADO } ledCal = LEDCAL_APAGADO;
+uint32_t tLedCal = 0;
+
+// Lo que avisa la mano (PaqueteMano)
+volatile bool manoCalibrando = false;
+volatile uint8_t manoPatron = LED_CAL_NO;   // patron del LED segun la fase de la calibracion
+volatile uint32_t tEstadoMano = 0;          // cuando llego el ultimo (0 = nunca)
+
+// =====================================================
 
 volatile uint32_t ackOk = 0, ackFallidos = 0;
 
@@ -185,6 +251,149 @@ void onEnviado(const uint8_t *mac, esp_now_send_status_t estado) {
 #endif
   if (estado == ESP_NOW_SEND_SUCCESS) ackOk++;
   else ackFallidos++;
+}
+
+// Paquete de vuelta de la mano: si esta calibrando (para el LED de calibracion)
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void onRecibido(const esp_now_recv_info_t *info, const uint8_t *datos, int largo) {
+#else
+void onRecibido(const uint8_t *mac, const uint8_t *datos, int largo) {
+#endif
+  if (largo != sizeof(PaqueteMano) || datos[0] != TIPO_MANO) return;
+  const PaqueteMano *m = (const PaqueteMano *)datos;
+  manoCalibrando = m->calibrando;
+  manoPatron = m->patronLed;
+  tEstadoMano = millis();
+}
+
+// =====================================================
+// BOTONES Y LEDS
+// =====================================================
+void iniciarBoton(Boton &b) {
+  pinMode(b.pin, INPUT_PULLUP);
+  delay(2);
+  b.estable = b.leido = digitalRead(b.pin) == BOTON_APRETADO;
+  b.tCambio = millis();
+}
+
+// Antirrebote: devuelve true cuando el estado filtrado cambia
+bool leerBoton(Boton &b) {
+  bool apretado = digitalRead(b.pin) == BOTON_APRETADO;
+  uint32_t ahora = millis();
+  if (apretado != b.leido) {
+    b.leido = apretado;
+    b.tCambio = ahora;
+  }
+  if (b.leido != b.estable && ahora - b.tCambio >= ANTIRREBOTE_MS) {
+    b.estable = b.leido;
+    return true;
+  }
+  return false;
+}
+
+void activarParada(bool activa) {
+  paradaEmergencia = activa;
+  tParada = millis();
+  Serial.println(activa ? ">>> BOTON PARADA: PARADA DE EMERGENCIA, la mano queda quieta (soltar el boton para seguir)"
+                        : ">>> BOTON PARADA: parada liberada, la mano vuelve a seguir al guante");
+}
+
+// Se llama muy seguido (tambien entre lectura y lectura de los sensores para
+// no perder un toque corto)
+void revisarBotones() {
+  // Parada (con retencion): vale el estado del boton
+  if (leerBoton(botonParada)) activarParada(botonParada.estable);
+
+  // Home (sin retencion): cada toque cambia de estado. Con la parada activa no
+  // hace nada (la mano no se puede mover)
+  if (leerBoton(botonHome) && botonHome.estable) {
+    if (paradaEmergencia) {
+      Serial.println(">>> BOTON HOME: ignorado, hay una PARADA DE EMERGENCIA");
+    } else {
+      homeGuante = !homeGuante;
+      Serial.println(homeGuante ? ">>> BOTON HOME: la mano va a HOME y se queda ahi (apretar otra vez para seguir al guante)"
+                                : ">>> BOTON HOME: la mano vuelve a seguir al guante");
+    }
+  }
+
+  // Calibracion (sin retencion): cada toque pide una calibracion guiada
+  if (leerBoton(botonCal) && botonCal.estable) {
+    if (ledCal == LEDCAL_ESPERANDO || ledCal == LEDCAL_CALIBRANDO) {
+      Serial.println(">>> BOTON CAL: ignorado, ya hay una calibracion en curso");
+    } else {
+      pedidosCal++;
+      ledCal = LEDCAL_ESPERANDO;
+      tLedCal = millis();
+      Serial.println(">>> BOTON CAL: calibracion pedida a la mano");
+    }
+  }
+}
+
+void escribirLed(uint8_t pin, bool prendido) {
+  digitalWrite(pin, prendido ? LED_ENCENDIDO : !LED_ENCENDIDO);
+}
+
+// LED de calibracion durante la calibracion: t = tiempo desde que empezo la fase
+bool ledPatronCal(uint8_t patron, uint32_t t) {
+  switch (patron) {
+    case LED_CAL_MOVER:   return (t / CAL_RAPIDO_MS) % 2 == 0;
+    case LED_CAL_SEPARAR: { uint32_t f = t % CAL_DOBLE_PERIODO_MS;
+                            return f < CAL_DESTELLO_MS || (f >= 2 * CAL_DESTELLO_MS && f < 3 * CAL_DESTELLO_MS); }
+    default:              return (t / CAL_LENTO_MS) % 2 == 0;   // LED_CAL_QUIETA
+  }
+}
+
+void actualizarLeds() {
+  uint32_t ahora = millis();
+
+  // Parada: parpadea mientras esta activa (arranca prendido)
+  escribirLed(PIN_LED_PARADA, paradaEmergencia && ((ahora - tParada) / PARPADEO_PARADA_MS) % 2 == 0);
+
+  // Home: fijo mientras esta pedido
+  escribirLed(PIN_LED_HOME, homeGuante);
+
+  // Calibracion
+  bool hayMano = tEstadoMano && ahora - tEstadoMano < ESTADO_MANO_TIMEOUT_MS;
+  bool calibrando = hayMano && manoCalibrando;
+  // Cada fase nueva arranca el patron desde el principio (prendido)
+  static uint8_t patronAntes = LED_CAL_NO;
+  static uint32_t tPatron = 0;
+  uint8_t patron = manoPatron;
+  if (patron != patronAntes) {
+    patronAntes = patron;
+    tPatron = ahora;
+  }
+  switch (ledCal) {
+    case LEDCAL_APAGADO:
+    case LEDCAL_TERMINADO:
+      // Tambien parpadea si se calibra con c o m desde el monitor del receptor
+      if (calibrando) { ledCal = LEDCAL_CALIBRANDO; tLedCal = ahora; }
+      else if (ledCal == LEDCAL_TERMINADO && ahora - tLedCal >= CAL_LED_FINAL_MS) ledCal = LEDCAL_APAGADO;
+      break;
+    case LEDCAL_ESPERANDO:
+      if (calibrando) {
+        ledCal = LEDCAL_CALIBRANDO;
+        tLedCal = ahora;
+      } else if (ahora - tLedCal >= CAL_ESPERA_MANO_MS) {
+        ledCal = LEDCAL_APAGADO;
+        Serial.println(hayMano ? ">>> BOTON CAL: la mano no pudo calibrar (todavia sin datos del guante: ver su monitor)"
+                               : ">>> BOTON CAL: la mano no responde (sin comunicacion)");
+      }
+      break;
+    case LEDCAL_CALIBRANDO:
+      if (!hayMano) {
+        ledCal = LEDCAL_APAGADO;
+        Serial.println(">>> CALIBRACION: se perdio la comunicacion con la mano");
+      } else if (!manoCalibrando) {
+        ledCal = LEDCAL_TERMINADO;
+        tLedCal = ahora;
+        Serial.println(">>> CALIBRACION terminada");
+      }
+      break;
+  }
+  bool prendido = ledCal == LEDCAL_ESPERANDO || ledCal == LEDCAL_TERMINADO ||
+                  (ledCal == LEDCAL_CALIBRANDO && ledPatronCal(patron, ahora - tPatron));
+  escribirLed(PIN_LED_CAL, prendido);
 }
 
 void selectMuxChannel(uint8_t canal) {
@@ -434,6 +643,17 @@ void setup() {
   pinMode(MUX_S2, OUTPUT);
   pinMode(MUX_S3, OUTPUT);
 
+  // Botones y LEDs. La parada vale como este el boton al encender (con
+  // retencion); HOME y CAL solo reaccionan a un toque nuevo.
+  pinMode(PIN_LED_PARADA, OUTPUT);
+  pinMode(PIN_LED_HOME, OUTPUT);
+  pinMode(PIN_LED_CAL, OUTPUT);
+  iniciarBoton(botonParada);
+  iniciarBoton(botonHome);
+  iniciarBoton(botonCal);
+  if (botonParada.estable) activarParada(true);
+  actualizarLeds();
+
   // Bateria: el bloqueo se recuerda aunque se apague el guante
   memoria.begin("guante", false);
   factorBateria = memoria.getFloat("factorB", 1.0f);
@@ -457,6 +677,7 @@ void setup() {
     while (true) delay(1000);
   }
   esp_now_register_send_cb(onEnviado);
+  esp_now_register_recv_cb(onRecibido);   // la mano avisa si esta calibrando
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, macReceptor, 6);
@@ -478,17 +699,24 @@ void loop() {
   static PaqueteGuante p = {};
 
   leerComandos();
+  revisarBotones();
+  actualizarLeds();
   if ((int32_t)(millis() - proximoEnvio) < 0) return;
   proximoEnvio += PERIODO_ENVIO_MS;
   // Si el loop se atraso, se resincroniza en vez de mandar una rafaga de paquetes
   if ((int32_t)(millis() - proximoEnvio) >= 0) proximoEnvio = millis() + PERIODO_ENVIO_MS;
 
   uint32_t inicioLectura = millis();
+  // (los botones se revisan entre sensor y sensor: la lectura tarda ~31 ms)
   for (int i = 0; i < CANT_FLEX; i++) {
     p.adc[i] = leerFlex(FLEX[i]);
     p.resistencia[i] = calcularResistencia(p.adc[i]);
+    revisarBotones();
   }
-  for (int i = 0; i < CANT_POT; i++) p.pot[i] = leerPot(POT[i]);
+  for (int i = 0; i < CANT_POT; i++) {
+    p.pot[i] = leerPot(POT[i]);
+    if (i % 3 == 0) revisarBotones();
+  }
   revisarBateria();
   uint32_t tiempoLectura = millis() - inicioLectura;
 
@@ -496,6 +724,9 @@ void loop() {
   p.bateria_mV = bateriaMedible() ? (uint16_t)lroundf(bateria * 1000) : 0;
   p.bateriaBaja = bateriaMedible() && bateriaBaja;
   p.estadoCarga = estadoCarga;
+  p.paradaEmergencia = paradaEmergencia;
+  p.home = homeGuante;
+  p.pedidosCal = pedidosCal;
   p.tipo = TIPO_GUANTE;
   p.seq++;
   p.t_ms = inicioLectura;
@@ -508,9 +739,10 @@ void loop() {
     for (int i = 0; i < CANT_FLEX; i++) Serial.printf(" %5lu", (unsigned long)p.resistencia[i]);
     Serial.print("       |");
     for (int i = 0; i < CANT_POT; i++) Serial.printf(" %5d", p.pot[i]);
-    Serial.printf(" | %2lu ms  %5.1f%% | %4.2f V%s%s\n", (unsigned long)tiempoLectura,
+    Serial.printf(" | %2lu ms  %5.1f%% | %4.2f V%s%s%s%s\n", (unsigned long)tiempoLectura,
                   ok + fail ? 100.0 * ok / (ok + fail) : 0.0, bateria,
                   p.bateriaBaja ? " BAJA" : "",
-                  estadoCarga == CARGA_CARGANDO ? " cargando" : estadoCarga == CARGA_LLENA ? " llena" : "");
+                  estadoCarga == CARGA_CARGANDO ? " cargando" : estadoCarga == CARGA_LLENA ? " llena" : "",
+                  paradaEmergencia ? " | PARADA" : "", homeGuante ? " | HOME" : "");
   }
 }

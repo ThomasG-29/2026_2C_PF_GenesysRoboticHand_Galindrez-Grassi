@@ -69,6 +69,18 @@
 //
 // HOME: al encender la mano va a la posicion anguloHome de SERVOS[] y se queda
 // ahi hasta que el guante esta conectado y calibrado (ver HOME mas abajo).
+// Si se pierde el guante (apagado o sin comunicacion) vuelve a HOME y lo
+// espera ahi; cuando vuelve, lo sigue de nuevo.
+//
+// BOTONES DEL GUANTE (ver BOTONES DEL GUANTE mas abajo):
+//   PARADA: los servos se quedan quietos donde estan hasta soltar el boton
+//           (tiene prioridad sobre todo: HOME, sin senal, h, t)
+//   HOME  : igual que h (otro toque: sigue al guante)
+//   CAL   : calibracion COMPLETA: c (dedos, con la fase de cerrar la mano mas
+//           corta, sin muneca) y enseguida m (muneca), ~61 s. La mano le avisa
+//           al guante en que fase esta (PaqueteMano) y el LED lo muestra:
+//           lento = mano abierta y quieta, rapido = hacer el movimiento que
+//           sigue, doble destello = separar los dedos.
 // =====================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -198,8 +210,11 @@ bool esBidireccional(int i) { return SERVOS[i].anguloOtroLado != SIN_OTRO_LADO; 
 // El comando h la lleva a HOME y la deja quieta ahi (h otra vez: sigue al guante).
 #define VELOCIDAD_HOME     60.0f   // grados por segundo yendo a HOME (despacio)
 #define ESPERA_HOME_MS     1500    // tiempo en HOME antes de empezar a seguir al guante
-#define VOLVER_HOME_SIN_SENAL 0    // 1: si se pierde el guante, la mano vuelve a HOME
+#define VOLVER_HOME_SIN_SENAL 1    // 1: si se pierde el guante (apagado o sin comunicacion) la
+                                   //    mano vuelve a HOME y espera ahi; cuando el guante vuelve
+                                   //    a aparecer, lo sigue de nuevo (despues de ESPERA_HOME_MS)
                                    // 0: se queda quieta en la ultima posicion
+                                   // (con la PARADA DE EMERGENCIA activa se queda quieta igual)
 
 // Suavizado de la resistencia: mas chico = mas suave pero mas lento
 #define ALPHA 0.3f
@@ -275,6 +290,8 @@ float aplicarHisteresis(float anterior, float medido, float banda) {
 //   3 SEPARAR : mano abierta, separar los dedos hacia los costados      -> doblado de pot. de la base
 #define CAL_ABIERTA_MS 4000
 #define CAL_CERRADA_MS 10000   // tiempo para cerrar la mano y llevar la muneca a todos lados
+#define CAL_CERRADA_COMPLETA_MS 6000   // calibracion completa (boton del guante): solo cerrar la
+                                       // mano, la muneca se calibra despues con sus posturas
 #define CAL_SEPARAR_MS 6000    // tiempo para abrir y separar los dedos
 #define RANGO_MINIMO   150     // ohms: si un flex cambia menos, no se calibra
                                // (con el guante puesto el pulgar y el anular cambian ~250)
@@ -366,6 +383,7 @@ QueueHandle_t cola;
 typedef struct {
   PaqueteGuante datos;
   uint32_t t_rx_ms;
+  uint8_t mac[6];   // de quien vino (para mandarle el paquete de vuelta)
 } Recepcion;
 
 uint32_t rPlano[CANT_CANALES], rDoblado[CANT_CANALES];
@@ -386,7 +404,17 @@ bool hayDatos = false;
 // HOME: mientras enHome los servos van a anguloHome e ignoran al guante
 bool enHome = true;          // al encender arranca en HOME
 bool homeManual = false;     // comando h: se queda en HOME hasta otro h
+bool homeBoton = false;      // boton HOME del guante: se queda en HOME hasta volver a apretarlo
 uint32_t tEnHome = 0;        // cuando llegaron todos los servos a HOME (0 = todavia no)
+
+// Botones del guante (ver BOTONES DEL GUANTE)
+bool paradaEmergencia = false;   // boton de parada (con retencion): los servos no se mueven
+int ultimoPedidoCal = -1;        // ultimo contador de calibracion del guante (-1 = sin dato)
+
+// Paquete de vuelta al guante (LED de calibracion): se registra la MAC de la
+// que llegan los paquetes del guante
+uint8_t macGuante[6];
+bool guanteRegistrado = false;
 
 // Proteccion por baja tension
 float tension = 0;              // V+ de los servos (filtrada)
@@ -418,6 +446,7 @@ uint64_t calSumaMuneca[3];   // R6, R7, R8 (para volver a tomar el centro de la 
 // Calibracion guiada
 enum { CAL_NO, CAL_ABIERTA, CAL_CERRADA, CAL_SEPARAR, CAL_MUNECA } calEstado = CAL_NO;
 uint32_t calInicio = 0, calUltimoAviso = 0;
+bool calCompleta = false;   // boton del guante: al terminar los dedos sigue con la muneca (como m)
 float calMax[CANT_CANALES], calMin[CANT_CANALES];
 
 // Calibracion de muneca (comando m): una fase por postura
@@ -460,6 +489,11 @@ void onRecibido(const uint8_t *mac, const uint8_t *datos, int largo) {
   Recepcion r;
   memcpy(&r.datos, datos, sizeof(PaqueteGuante));
   r.t_rx_ms = millis();
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  memcpy(r.mac, info->src_addr, 6);
+#else
+  memcpy(r.mac, mac, 6);
+#endif
   xQueueSend(cola, &r, 0);
 }
 
@@ -472,6 +506,82 @@ void escribirServo(int i, float angulo) {
   angulo = constrain(angulo, 0.0f, 180.0f);
   float us = s.minUs + angulo * (s.maxUs - s.minUs) / 180.0f;
   pca.setPWM(s.canal, 0, (uint16_t)lroundf(us * 4096.0f / 20000.0f));
+}
+
+// =====================================================
+// PCA9685: CONFIGURACION Y VIGILANCIA
+// =====================================================
+// Si la alimentacion logica del PCA9685 tiene un bajon, el chip se reinicia y
+// queda DORMIDO (sin pulsos: los servos no se mueven) pero sigue respondiendo
+// por I2C. Se revisa cada PERIODO_PCA_MS y si se reinicio se vuelve a configurar.
+#define PCA_DIRECCION   0x40
+#define PCA_MODE1       0x00
+#define PCA_PRESCALE    0xFE
+#define PCA_MODE1_SLEEP 0x10
+#define PCA_MODE1_EXTCLK 0x40   // reloj externo: el modulo no tiene, sin esto no hay pulsos. Queda
+                                // "pegado": solo lo borra cortar la alimentacion o el reset por software
+#define PERIODO_PCA_MS  1000
+
+// Reset por software (llamada general I2C 0x00 + 0x06): deja el PCA9685 como
+// recien encendido, incluido el bit EXTCLK que pudo quedar puesto por un glitch del I2C
+void resetSoftwarePCA() {
+  Wire.beginTransmission(0x00);
+  Wire.write(0x06);
+  Wire.endTransmission();
+  delay(2);
+}
+
+int prescaleEsperado = -1;   // el que queda despues de setPWMFreq(50)
+uint32_t reiniciosPCA = 0;
+
+int leerRegistroPCA(uint8_t reg) {
+  Wire.beginTransmission(PCA_DIRECCION);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) return -1;
+  if (Wire.requestFrom(PCA_DIRECCION, 1) != 1) return -1;
+  return Wire.read();
+}
+
+// Configura el PCA9685 (50 Hz) y apaga los canales sin servo
+void configurarPCA() {
+  resetSoftwarePCA();
+  pca.begin();
+  pca.setPWMFreq(50);
+  delay(10);
+  for (int canal = 0; canal < 16; canal++) {
+    bool usado = false;
+    for (int i = 0; i < CANT_CANALES; i++) usado |= SERVOS[i].canal == canal;
+    if (!usado) pca.setPWM(canal, 0, 4096);   // 4096 = salida siempre apagada
+  }
+  prescaleEsperado = leerRegistroPCA(PCA_PRESCALE);
+}
+
+// Se llama seguido desde loop()
+void revisarPCA() {
+  static uint32_t tRevision = 0, tAvisoNoResponde = 0;
+  uint32_t ahora = millis();
+  if (ahora - tRevision < PERIODO_PCA_MS) return;
+  tRevision = ahora;
+
+  int mode1 = leerRegistroPCA(PCA_MODE1);
+  int prescale = leerRegistroPCA(PCA_PRESCALE);
+  if (mode1 < 0 || prescale < 0) {
+    if (ahora - tAvisoNoResponde > 5000) {
+      tAvisoNoResponde = ahora;
+      Serial.println(">>> PCA9685: NO RESPONDE por I2C: revisar SDA (GPIO21), SCL (GPIO22), VCC y GND del PCA9685");
+    }
+    return;
+  }
+  if (!(mode1 & (PCA_MODE1_SLEEP | PCA_MODE1_EXTCLK)) && prescale == prescaleEsperado) return;
+
+  reiniciosPCA++;
+  Serial.printf(">>> PCA9685 SE REINICIO (MODE1 0x%02X, prescale %d en vez de %d): se vuelve a configurar."
+                " Revisar su alimentacion VCC/GND (bajones)\n", mode1, prescale, prescaleEsperado);
+  configurarPCA();
+  for (int i = 0; i < CANT_CANALES; i++) {
+    if (servosApagados) pca.setPWM(SERVOS[i].canal, 0, 4096);
+    else escribirServo(i, anguloServo[i]);
+  }
 }
 
 // =====================================================
@@ -492,7 +602,7 @@ void actualizarHome() {
   uint32_t ahora = millis();
   float paso = VELOCIDAD_HOME * (ahora - tAnterior) / 1000.0f;
   tAnterior = ahora;
-  if (!enHome) return;
+  if (!enHome || paradaEmergencia) return;   // parada: quietos aunque no hayan llegado a HOME
 
   bool todosEnHome = true;
   for (int i = 0; i < CANT_CANALES; i++) {
@@ -512,7 +622,7 @@ void actualizarHome() {
   // (con falla de tension se queda en HOME hasta rearmar con h; con la bateria
   // del guante baja, hasta que el guante avise que se cargo)
   bool guanteListo = hayDatos && !calibrandoInicio && !sinSenalAvisado && !bateriaGuanteBaja;
-  if (!homeManual && !fallaTension && guanteListo && ahora - tEnHome >= ESPERA_HOME_MS) {
+  if (!homeManual && !homeBoton && !fallaTension && guanteListo && ahora - tEnHome >= ESPERA_HOME_MS) {
     enHome = false;
     Serial.println(">>> Siguiendo al guante");
   }
@@ -639,7 +749,9 @@ void actualizarServos() {
   if (ahora - tAnterior < PERIODO_SERVOS_MS) return;
   float dt = min(ahora - tAnterior, (uint32_t)50) / 1000.0f;
   tAnterior = ahora;
-  if (enHome || !hayObjetivo) {               // en HOME manda actualizarHome()
+  // En HOME manda actualizarHome(); con la parada de emergencia los servos se
+  // quedan donde estan (el PCA9685 sigue mandando el ultimo pulso: hacen fuerza)
+  if (enHome || !hayObjetivo || paradaEmergencia) {
     for (int i = 0; i < CANT_CANALES; i++) moviendo[i] = false;
     return;
   }
@@ -991,8 +1103,13 @@ void terminarCalibracionInicio() {
   imprimirEncabezado();
 }
 
-void iniciarCalibracionGuiada() {
+void iniciarCalibracionMuneca();   // esta mas abajo
+
+// completa = true (boton del guante): dedos y despues muneca (c + m seguidas)
+void iniciarCalibracionGuiada(bool completa = false) {
   if (!hayDatos || calibrandoInicio) { Serial.println(">>> Sin datos del guante: no se puede calibrar"); return; }
+  calCompleta = completa;
+  if (completa) Serial.println("\n>>> CALIBRACION COMPLETA: dedos (3 fases) y despues muneca (7 fases)");
   calEstado = CAL_ABIERTA;
   calInicio = calUltimoAviso = millis();
   calCant = 0;
@@ -1023,12 +1140,18 @@ void calibrarPotenciometro(int i, float plano) {
 void avanzarCalibracionGuiada() {
   uint32_t ahora = millis();
   if (calEstado == CAL_ABIERTA && ahora - calInicio >= CAL_ABIERTA_MS) {
-    if (calCant == 0) { Serial.println(">>> Sin datos: calibracion cancelada"); calEstado = CAL_NO; return; }
+    if (calCant == 0) {
+      Serial.println(">>> Sin datos: calibracion cancelada");
+      calEstado = CAL_NO;
+      calCompleta = false;
+      return;
+    }
     for (int i = 0; i < CANT_CANALES; i++) calMax[i] = calMin[i] = calSuma[i] / calCant;
     calEstado = CAL_CERRADA;
     calInicio = calUltimoAviso = ahora;
-    Serial.println(">>> CALIBRACION 2/3: Cerrar la mano fuerte, doblando los nudillos. Despues muneca adelante, al menique y al pulgar.");
-  } else if (calEstado == CAL_CERRADA && ahora - calInicio >= CAL_CERRADA_MS) {
+    Serial.println(calCompleta ? ">>> CALIBRACION 2/3: Cerrar la mano fuerte, doblando los nudillos."
+                               : ">>> CALIBRACION 2/3: Cerrar la mano fuerte, doblando los nudillos. Despues muneca adelante, al menique y al pulgar.");
+  } else if (calEstado == CAL_CERRADA && ahora - calInicio >= (calCompleta ? CAL_CERRADA_COMPLETA_MS : CAL_CERRADA_MS)) {
     calEstado = CAL_SEPARAR;
     calInicio = calUltimoAviso = ahora;
     Serial.println(">>> CALIBRACION 3/3: Abrir la mano y separar los dedos hacia los costados, al maximo.");
@@ -1071,13 +1194,21 @@ void avanzarCalibracionGuiada() {
       if (esBidireccional(i) && !otroLadoValido(i)) rOtroLado[i] = otroLadoInicial(rPlano[i]);
     }
     guardarCalibracion();
+    if (calCompleta) {
+      // Boton del guante: sigue con la muneca (igual que m)
+      calCompleta = false;
+      Serial.println(">>> Calibracion de los dedos terminada y guardada. Sigue la muneca.");
+      iniciarCalibracionMuneca();
+      return;
+    }
     Serial.println(">>> Calibracion terminada y guardada.");
     imprimirCalibracion();
     imprimirEncabezado();
   } else if (ahora - calUltimoAviso >= 1000) {
     calUltimoAviso = ahora;
     uint32_t total = calEstado == CAL_ABIERTA ? CAL_ABIERTA_MS
-                   : calEstado == CAL_CERRADA ? CAL_CERRADA_MS : CAL_SEPARAR_MS;
+                   : calEstado == CAL_CERRADA ? (calCompleta ? CAL_CERRADA_COMPLETA_MS : CAL_CERRADA_MS)
+                                              : CAL_SEPARAR_MS;
     Serial.printf(">>> ... %lu s\n", (unsigned long)((total - (ahora - calInicio) + 999) / 1000));
   }
 }
@@ -1190,6 +1321,91 @@ void avanzarCalibracionMuneca() {
 }
 
 // =====================================================
+// BOTONES DEL GUANTE
+// =====================================================
+// El guante manda en cada paquete el estado de sus botones:
+//   paradaEmergencia: los servos se quedan donde estan hasta que se suelte
+//   home: igual que h (HOME y quieta ahi), hasta que se vuelva a apretar
+//   pedidosCal: cuando cambia, calibracion guiada (igual que c)
+void revisarBotonesGuante(const PaqueteGuante &p) {
+  if ((bool)p.paradaEmergencia != paradaEmergencia) {
+    paradaEmergencia = p.paradaEmergencia;
+    Serial.println(paradaEmergencia ? ">>> PARADA DE EMERGENCIA: servos quietos en la posicion actual (soltar el boton del guante para seguir)"
+                                    : ">>> PARADA DE EMERGENCIA liberada");
+  }
+
+  if ((bool)p.home != homeBoton) {
+    homeBoton = p.home;
+    if (homeBoton) {
+      Serial.println(">>> HOME (boton del guante): la mano va a HOME y se queda ahi (apretarlo otra vez para seguir al guante)");
+      enHome = true;
+      tEnHome = 0;
+    } else {
+      Serial.println(">>> HOME (boton del guante): vuelve a seguir al guante");
+    }
+  }
+
+  // Calibracion: el primer paquete (o el primero despues de reiniciar el guante)
+  // solo toma el valor del contador
+  if (ultimoPedidoCal >= 0 && p.pedidosCal != ultimoPedidoCal) {
+    if (calEstado == CAL_NO) {
+      Serial.println(">>> CALIBRACION pedida con el boton del guante");
+      iniciarCalibracionGuiada(true);   // dedos + muneca
+    } else {
+      Serial.println(">>> Boton de calibracion ignorado: ya hay una calibracion en curso");
+    }
+  }
+  ultimoPedidoCal = p.pedidosCal;
+}
+
+// Registra al guante como destino del paquete de vuelta (se hace con el
+// primer paquete: asi no hace falta escribir su MAC aca)
+void registrarGuante(const uint8_t *mac) {
+  static bool avisoError = false;
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = CANAL_ESPNOW;
+  peer.encrypt = false;
+  esp_err_t e = esp_now_add_peer(&peer);
+  if (e == ESP_OK || e == ESP_ERR_ESPNOW_EXIST) {
+    memcpy(macGuante, mac, 6);
+    guanteRegistrado = true;
+    Serial.printf(">>> Guante: %02X:%02X:%02X:%02X:%02X:%02X (le avisa cuando calibra, para su LED)\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  } else if (!avisoError) {
+    avisoError = true;
+    Serial.printf(">>> ERROR: no se pudo registrar al guante para responderle (%d): su LED de calibracion no va a andar\n", e);
+  }
+}
+
+// Que tiene que mostrar el LED de calibracion del guante en la fase actual
+uint8_t patronLedCal() {
+  switch (calEstado) {
+    case CAL_ABIERTA: return LED_CAL_QUIETA;
+    case CAL_CERRADA: return LED_CAL_MOVER;
+    case CAL_SEPARAR: return LED_CAL_SEPARAR;
+    case CAL_MUNECA:
+      return FASES_MUNECA[faseMuneca].postura == POSTURA_CENTRO ? LED_CAL_QUIETA : LED_CAL_MOVER;
+    default: return LED_CAL_NO;
+  }
+}
+
+// Paquete de vuelta: cada PERIODO_ESTADO_MS y en cuanto cambia la fase de la calibracion
+#define PERIODO_ESTADO_MS 100
+void enviarEstadoAlGuante() {
+  static uint32_t tEnvio = 0;
+  static uint8_t patronAntes = LED_CAL_NO;
+  if (!guanteRegistrado || sinSenalAvisado) return;   // guante apagado: no hay a quien mandarle
+  uint8_t patron = patronLedCal();
+  uint32_t ahora = millis();
+  if (patron == patronAntes && ahora - tEnvio < PERIODO_ESTADO_MS) return;
+  patronAntes = patron;
+  tEnvio = ahora;
+  PaqueteMano m = {TIPO_MANO, (uint8_t)(calEstado != CAL_NO), patron};
+  esp_now_send(macGuante, (uint8_t *)&m, sizeof(m));
+}
+
+// =====================================================
 // RECEPCION
 // =====================================================
 void procesar(const Recepcion &r) {
@@ -1199,6 +1415,7 @@ void procesar(const Recepcion &r) {
   if (ultimoSeq != 0 && p.seq < ultimoSeq) {
     Serial.println(">>> Transmisor reiniciado: contadores a cero");
     recibidos = perdidos = ultimoSeq = 0;
+    ultimoPedidoCal = -1;   // el contador de calibracion del guante tambien arranca de cero
   }
   if (p.seq == ultimoSeq) return;                       // duplicado
   if (ultimoSeq != 0 && p.seq > ultimoSeq + 1) perdidos += p.seq - ultimoSeq - 1;
@@ -1211,6 +1428,8 @@ void procesar(const Recepcion &r) {
     Serial.println(">>> Senal recuperada");
     sinSenalAvisado = false;
   }
+  if (!guanteRegistrado) registrarGuante(r.mac);
+  revisarBotonesGuante(p);
 
   // Bateria del guante: baja -> HOME y bloqueo; cargada -> actualizarHome() la libera
   bateriaGuante_mV = p.bateria_mV;
@@ -1316,6 +1535,8 @@ void procesar(const Recepcion &r) {
     if (divisorConectado) Serial.printf(" | %4.2f V", tension);
     if (bateriaGuante_mV) Serial.printf(" | guante %4.2f V%s%s", bateriaGuante_mV / 1000.0,
                                         bateriaGuanteBaja ? " BAJA" : "", textoCargaGuante());
+    if (paradaEmergencia) Serial.print(" | PARADA");
+    if (homeBoton || homeManual) Serial.print(" | HOME");
     Serial.println();
   }
 }
@@ -1390,7 +1611,9 @@ void ejecutarComando(char *linea) {
   } else if (c == 'c') {
     iniciarCalibracionGuiada();
   } else if (c == 'h') {
-    if (bateriaGuanteBaja) {
+    if (paradaEmergencia) {
+      Serial.println(">>> PARADA DE EMERGENCIA activa: la mano no se mueve (soltar el boton del guante)");
+    } else if (bateriaGuanteBaja) {
       Serial.printf(">>> BATERIA DEL GUANTE BAJA (%.2f V): cargar el guante para volver a mover la mano\n",
                     bateriaGuante_mV / 1000.0);
     } else if (fallaTension) {
@@ -1398,7 +1621,10 @@ void ejecutarComando(char *linea) {
       if (rearmarTension()) homeManual = false;
     } else if (homeManual) {
       homeManual = false;   // actualizarHome() devuelve el control al guante
-      Serial.println(">>> HOME: vuelve a seguir al guante");
+      Serial.println(homeBoton ? ">>> HOME: sigue en HOME por el boton del guante (apretarlo para seguir al guante)"
+                               : ">>> HOME: vuelve a seguir al guante");
+    } else if (homeBoton) {
+      Serial.println(">>> HOME pedido con el boton del guante: apretarlo otra vez para seguir al guante");
     } else {
       irAHome(true);
     }
@@ -1418,11 +1644,17 @@ void ejecutarComando(char *linea) {
                     bateriaGuanteBaja ? " | BAJA: mano bloqueada en HOME hasta cargar" : "");
     else
       Serial.println(">>> BATERIA DEL GUANTE: el guante no la puede medir (o no llego ningun paquete)");
-    Wire.beginTransmission(0x40);
-    Serial.println(Wire.endTransmission() == 0 ? ">>> PCA9685: responde por I2C (0x40)"
-                                               : ">>> PCA9685: NO RESPONDE por I2C: revisar SDA (GPIO21), SCL (GPIO22), VCC y GND del PCA9685");
+    int mode1 = leerRegistroPCA(PCA_MODE1), prescale = leerRegistroPCA(PCA_PRESCALE);
+    if (mode1 < 0)
+      Serial.println(">>> PCA9685: NO RESPONDE por I2C: revisar SDA (GPIO21), SCL (GPIO22), VCC y GND del PCA9685");
+    else
+      Serial.printf(">>> PCA9685: responde por I2C (0x40) | MODE1 0x%02X%s | prescale %d (esperado %d) | se reinicio %lu veces\n",
+                    mode1, mode1 & PCA_MODE1_SLEEP ? " DORMIDO" : mode1 & PCA_MODE1_EXTCLK ? " RELOJ EXTERNO" : "",
+                    prescale, prescaleEsperado,
+                    (unsigned long)reiniciosPCA);
   } else if (c == 't' && n) {
-    probarServo(n - 1);
+    if (paradaEmergencia) Serial.println(">>> PARADA DE EMERGENCIA activa: no se prueban servos");
+    else probarServo(n - 1);
   } else if (c == 'a' && n) {
     int plano, doblado, otro;
     int leidos = sscanf(linea + 1, "%*d %d %d %d", &plano, &doblado, &otro);
@@ -1493,19 +1725,11 @@ void setup() {
     Serial.printf("ATENCION: no se detecta el divisor de tension en GPIO%d: PROTECCION DESACTIVADA\n", PIN_TENSION);
 
   Wire.begin(I2C_SDA, I2C_SCL);
-  pca.begin();
-  Wire.beginTransmission(0x40);
+  Wire.beginTransmission(PCA_DIRECCION);
   if (Wire.endTransmission() != 0)
     Serial.println("ATENCION: el PCA9685 NO RESPONDE por I2C: revisar SDA (GPIO21), SCL (GPIO22), VCC y GND");
-  pca.setPWMFreq(50);
-  delay(10);
-
-  // Los canales sin flex asignado quedan apagados (servo suelto)
-  for (int canal = 0; canal < 16; canal++) {
-    bool usado = false;
-    for (int i = 0; i < CANT_CANALES; i++) usado |= SERVOS[i].canal == canal;
-    if (!usado) pca.setPWM(canal, 0, 4096);   // 4096 = salida siempre apagada
-  }
+  // 50 Hz; los canales sin servo quedan apagados (servo suelto)
+  configurarPCA();
 
   // Lleva los servos a HOME de a uno (sin pico de corriente). El servo no
   // informa donde esta, asi que este primer movimiento es a su velocidad maxima;
@@ -1532,6 +1756,7 @@ void setup() {
   Serial.println("          h = ir a HOME y quedarse (h otra vez = seguir al guante; tambien rearma tras falla de tension)");
   Serial.println("          v = ver tension de los servos | v 5.12 = corregir con lo que marca el tester");
   Serial.println("          w = modo ajuste de potenciometros (solo muestra los potenciometros)");
+  Serial.println("Botones del guante: PARADA (quieta donde esta) | HOME (igual que h) | CAL (c y despues m)");
 
   cola = xQueueCreate(20, sizeof(Recepcion));
   if (esp_now_init() != ESP_OK) {
@@ -1559,17 +1784,26 @@ void loop() {
   if (calEstado == CAL_MUNECA) avanzarCalibracionMuneca();
   else if (calEstado != CAL_NO) avanzarCalibracionGuiada();
 
-  // Sin paquetes: los servos se quedan en la ultima posicion (o vuelven a HOME)
+  // Sin paquetes (guante apagado o fuera de alcance): la mano vuelve a HOME (o
+  // se queda en la ultima posicion) y sigue escuchando: en cuanto llega un
+  // paquete, procesar() avisa "Senal recuperada" y actualizarHome() le
+  // devuelve el control al guante
   if (tUltimoRx && !sinSenalAvisado && millis() - tUltimoRx > TIMEOUT_SENAL_MS) {
-    Serial.println(VOLVER_HOME_SIN_SENAL ? ">>> SIN SENAL del transmisor"
-                                         : ">>> SIN SENAL del transmisor (servos quietos en la ultima posicion)");
+    if (!VOLVER_HOME_SIN_SENAL)
+      Serial.println(">>> SIN SENAL del guante (servos quietos en la ultima posicion). Esperando al guante...");
+    else if (paradaEmergencia)
+      Serial.println(">>> SIN SENAL del guante con PARADA DE EMERGENCIA: la mano se queda quieta. Esperando al guante...");
+    else
+      Serial.println(">>> SIN SENAL del guante: la mano va a HOME. Esperando al guante...");
     sinSenalAvisado = true;
     if (VOLVER_HOME_SIN_SENAL) irAHome(false);
   }
 
   revisarTension();
+  revisarPCA();
   actualizarHome();
   actualizarServos();
+  enviarEstadoAlGuante();
 
   // Nunca llego un paquete: avisar cada 3 s (si no, el receptor queda en silencio)
   static uint32_t ultimoAvisoEspera = millis();
