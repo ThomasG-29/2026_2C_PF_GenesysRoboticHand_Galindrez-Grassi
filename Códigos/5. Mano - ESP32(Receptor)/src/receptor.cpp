@@ -270,6 +270,9 @@ float aplicarHisteresis(float anterior, float medido, float banda) {
                                   // un instante al arrancar un servo no cuentan)
 #define TIEMPO_RECUPERADA_MS 3000 // tiene que estar recuperada este tiempo seguido para rearmar
 #define TENSION_SIN_DIVISOR 2.0f  // V: si al encender se lee menos, el divisor no esta conectado
+#define MUESTRAS_TENSION   8      // muestras del ADC promediadas en cada lectura (cada 5 ms)
+#define FILTRO_TENSION     0.1f   // filtro de la lectura: ~50 ms (con 0.3 = 15 ms el ruido era ±0.2 V).
+                                  // Un bajon real a menos de 4.3 V igual actua en ~0.2 s
 
 // =====================================================
 // CALIBRACION DE LOS FLEX (ohms)
@@ -631,8 +634,11 @@ void actualizarHome() {
 // =====================================================
 // PROTECCION POR BAJA TENSION
 // =====================================================
+// Promedia varias muestras del ADC: una sola tiene unos ±0.5 V de ruido (WiFi + ripple de la fuente)
 float leerTension() {
-  return analogReadMilliVolts(PIN_TENSION) / 1000.0f * DIVISOR_TENSION * factorTension;
+  uint32_t suma = 0;
+  for (int k = 0; k < MUESTRAS_TENSION; k++) suma += analogReadMilliVolts(PIN_TENSION);
+  return suma / (float)MUESTRAS_TENSION / 1000.0f * DIVISOR_TENSION * factorTension;
 }
 
 void apagarServos() {
@@ -674,7 +680,7 @@ void revisarTension() {
   tMedicion = ahora;
 
   float v = leerTension();
-  tension = tension == 0 ? v : tension + 0.3f * (v - tension);   // filtro: ~15 ms
+  tension = tension == 0 ? v : tension + FILTRO_TENSION * (v - tension);
   if (!divisorConectado) {
     if (ahora - tAviso > 10000) {
       tAviso = ahora;
