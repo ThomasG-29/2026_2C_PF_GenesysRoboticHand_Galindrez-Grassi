@@ -693,7 +693,7 @@ void revisarTension() {
       irAHome(false);
       Serial.printf(">>> TENSION DE CORTE: %.2f V (< %.1f V). SERVOS APAGADOS (sueltos, sin fuerza).\n",
                     tension, TENSION_CORTE);
-      Serial.println(">>> Revisar la fuente. Con la tension recuperada, escribir h para rearmar.");
+      Serial.println(">>> Revisar la fuente. Con la tension recuperada, escribir h o apretar HOME en el guante para rearmar.");
     }
   } else {
     tBajoCorte = 0;
@@ -707,7 +707,7 @@ void revisarTension() {
       irAHome(false);
       Serial.printf(">>> TENSION CRITICA: %.2f V (< %.1f V). La mano deja de seguir al guante y va a HOME.\n",
                     tension, TENSION_CRITICA);
-      Serial.println(">>> Revisar la fuente. Con la tension recuperada, escribir h para rearmar.");
+      Serial.println(">>> Revisar la fuente. Con la tension recuperada, escribir h o apretar HOME en el guante para rearmar.");
     }
   } else {
     tBajoCritica = 0;
@@ -726,7 +726,7 @@ void revisarTension() {
     if (!tRecuperada) tRecuperada = ahora;
     if (!avisoRecuperada && ahora - tRecuperada >= TIEMPO_RECUPERADA_MS) {
       avisoRecuperada = true;
-      Serial.printf(">>> TENSION recuperada (%.2f V): escribir h para rearmar\n", tension);
+      Serial.printf(">>> TENSION recuperada (%.2f V): escribir h o apretar HOME en el guante para rearmar\n", tension);
     }
   } else {
     tRecuperada = 0;
@@ -1325,7 +1325,8 @@ void avanzarCalibracionMuneca() {
 // =====================================================
 // El guante manda en cada paquete el estado de sus botones:
 //   paradaEmergencia: los servos se quedan donde estan hasta que se suelte
-//   home: igual que h (HOME y quieta ahi), hasta que se vuelva a apretar
+//   home: igual que h (HOME y quieta ahi), hasta que se vuelva a apretar.
+//         Con falla de tension, apretarlo tambien rearma (como h)
 //   pedidosCal: cuando cambia, calibracion guiada (igual que c)
 void revisarBotonesGuante(const PaqueteGuante &p) {
   if ((bool)p.paradaEmergencia != paradaEmergencia) {
@@ -1336,6 +1337,17 @@ void revisarBotonesGuante(const PaqueteGuante &p) {
 
   if ((bool)p.home != homeBoton) {
     homeBoton = p.home;
+    // Con falla de tension, el boton tambien rearma (igual que h: solo con mas
+    // de TENSION_RECUPERADA). Despues sigue su logica normal, asi la mano queda
+    // como indica el LED HOME del guante: prendido -> en HOME, apagado -> sigue al guante
+    if (fallaTension) {
+      if (paradaEmergencia)
+        Serial.println(">>> TENSION: no se rearma con la PARADA DE EMERGENCIA activa (soltarla y apretar HOME otra vez)");
+      else if (bateriaGuanteBaja)
+        Serial.println(">>> TENSION: no se rearma con la BATERIA DEL GUANTE BAJA");
+      else if (rearmarTension())
+        homeManual = false;
+    }
     if (homeBoton) {
       Serial.println(">>> HOME (boton del guante): la mano va a HOME y se queda ahi (apretarlo otra vez para seguir al guante)");
       enHome = true;
