@@ -1,0 +1,36 @@
+*se puso a cargar 11:49hs con 3.40v
+*tardo 1:08 hs en cargar hasta 3,98 v
+*tardo 2:20 hs en cargar completo (4,04v)
+
+GPIO 0 led parada
+GPIO 5 botón parada
+GPIO 6 led home
+GPIO 7 botón home
+GPIO 20 led cal
+GPIO 21 botón cal
+
+Sensor	Dónde está	Movimiento que mide	Canal	Recorrido
+F1	Pulgar	Flexión del pulgar	Mux1 C0	182 mV
+F2	Índice	Flexión del índice	Mux1 C1	126 mV
+F3	Medio	Flexión del medio	Mux1 C2	136 mV
+F4	Anular	Flexión del anular	Mux1 C13	154 mV
+F5	Meñique	Flexión del meñique	Mux1 C4	122 mV
+F6	Muñeca, centro	Muñeca hacia adelante	Mux1 C5	158 mV
+F7	Muñeca, lado del meñique	Muñeca hacia el meñique	Mux1 C6	266 mV
+F8	Muñeca, lado del pulgar	Muñeca hacia el pulgar (sin servo propio, se usa para separar el costado del adelante)	Mux1 C12	204 mV
+Potenciómetros de la base: apertura lateral (separar los dedos)
+
+Sensor	Dedo	Canal	Recorrido
+Bpul	Pulgar	Mux1 C7	562 mV
+Bind	Índice	Mux1 C8	784 mV
+Bmed	Medio	Mux1 C9	484 mV
+Banu	Anular	Mux1 C10	516 mV
+Bmen	Meñique	Mux1 C11	414 mV
+Potenciómetros de arriba: flexión del nudillo
+
+Sensor	Dedo	Canal	Recorrido
+Apul	Pulgar	Mux2 C1	648 mV
+Aind	Índice	Mux2 C2	774 mV
+Amed	Medio	Mux2 C3	534 mV
+Aanu	Anular	Mux2 C4	582 mV
+Amen	Meñique	Mux2 C5	324 mV

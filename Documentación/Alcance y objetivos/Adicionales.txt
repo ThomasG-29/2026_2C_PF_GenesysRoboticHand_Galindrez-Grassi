@@ -1,0 +1,3 @@
+- Que se pueda calibrar el guante según la persona que la utilice y que los servos se adapten a este. Agregar un botón para modo calibración o mismo mediante software
+- Agregar un cero o un home al guante para que comience la medición de sensores en esa posición.
+- Agregar cámara a la mano robot para seguimiento y monitoreo de tareas

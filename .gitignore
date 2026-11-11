@@ -1,9 +1,18 @@
-# Solo se sincroniza con GitHub la carpeta Códigos.
-# CAD, documentación y conexionados quedan en OneDrive.
+# Se sincronizan con GitHub: Códigos, Documentación y Conexionados.
+# CAD, fotos/videos y el resto quedan solo en OneDrive.
 # (Los archivos de esas carpetas que ya estaban en GitHub siguen ahí.)
 /*
 !/Códigos/
+!/Documentación/
+!/Conexionados/
 !/.gitignore
 !/.gitattributes
 
 desktop.ini
+~$*
+
+# Instaladores (pesados, se bajan de la web de Fritzing)
+*.exe
+*.msi
+*.dmg
+*.AppImage
