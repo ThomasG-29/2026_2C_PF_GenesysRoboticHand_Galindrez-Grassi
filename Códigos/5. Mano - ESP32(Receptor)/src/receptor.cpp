@@ -5,7 +5,8 @@
 // Cada sensor con su servo es un "canal" (1 a 16, ver SERVOS[]):
 //
 //   canal 1-5   flex 1 al 5               -> MG90S  S1 a S5   (PCA 0 a 4)
-//   canal 6-7   flex 6 y 7 (muneca)       -> DS3225 S11 y S12 (PCA 10 y 11)
+//   canal 6-7   flex 6 y 7 (muneca)       -> DS3225 S11 y S12 (PCA 10 y 11) en DIFERENCIAL:
+//               canal 6 = adelante/atras, canal 7 = lateral (ver MUNECA DIFERENCIAL)
 //               flex 8 (costado del pulgar de la muneca) no tiene servo ni
 //               canal propio: se usa para la compensacion de muneca
 //   canal 8-11  pot. base (apertura)      -> MG92B  S13 a S16 (PCA 12 a 15)
@@ -16,6 +17,12 @@
 //   El dedo medio no tiene apertura lateral: su potenciometro de la base no se usa.
 //   (segun Conexionados/Circuito_mano_robot)
 //
+// RANGOS: los de pulgar, indice, medio, anular y muneca son los calibrados con la mano
+// armada en "2. Mano - Servos_esp32_PCA" (prueba sin guante, 2026-11-15), con la MISMA
+// escala de pulso (600-2400 us los dedos, 500-2500 los DS3225).
+// El MENIQUE (S5, S10, S16) y la apertura del ANULAR (S15) todavia no se calibraron:
+// estan DESACTIVADOS (sin pulso). Para usarlos, poner su canal del PCA en SERVOS[].
+//
 // MUNECA: flex 6 (adelante), flex 7 y flex 8 (los dos costados). Los tres se
 // arrastran entre si por como estan en el guante, asi que con la muneca
 // calibrada (comando m) se mueven juntos (ver COMPENSACION DE LA MUNECA):
@@ -23,9 +30,11 @@
 //     que al ir hacia adelante (los dos casi igual) no es costado; si uno sube
 //     y el otro baja (o no cambia), es costado.
 //   - adelante sale del flex 6, restandole lo que le sube por el costado.
-// El servo lateral (S12) es uno solo y va hacia los dos lados:
-//   muneca al menique -> anguloDoblado (170) | derecha -> anguloPlano (90) | al pulgar -> anguloOtroLado (10)
-// Si el servo gira al reves, intercambiar esos dos angulos (a7 90 10 170).
+// El lateral (canal 7) va hacia los dos lados:
+//   muneca al menique -> anguloDoblado (120) | derecha -> anguloPlano (100) | al pulgar -> anguloOtroLado (76)
+// Si gira al reves, intercambiar esos dos angulos (a7 100 76 120).
+// Adelante (canal 6): derecha -> 90, adelante -> 110. El flex 6 solo mide hacia adelante:
+// hacia atras (70) la mano no va con el guante.
 //
 // Sin la calibracion de muneca (o despues de x), cada flex mueve su servo como
 // antes: flex 6 adelante y flex 7 PRE-CURVADO hacia los dos lados (sube R ->
@@ -41,6 +50,10 @@
 //            cerrar la mano y mover la muneca (10 s), separar los dedos (6 s)
 //   p / d  : tomar el valor actual de TODOS los canales como estirado / doblado
 //   p3, d3 : lo mismo pero solo para el canal 3 (1 a 16)
+//   i14    : dar vuelta el sentido del potenciometro del canal 14 (el dedo del robot va al reves)
+//   z      : HOME DEL GUANTE: la postura actual del guante (puesto, en la posicion de HOME) pasa a
+//            ser el estirado de todos los canales y el centro de la muneca, SIN cambiar el recorrido
+//            de cada uno (p deja el doblado viejo). Se guarda. z3 = solo el canal 3
 //   m      : calibracion de muneca con el guante puesto: centro, adelante, costado
 //            del menique y del pulgar (7 s cada postura). Mide cuanto cambian los
 //            flex 6, 7 y 8 en cada postura y separa los dos movimientos.
@@ -57,6 +70,8 @@
 //   h      : llevar la mano a HOME y dejarla quieta ahi (h otra vez: sigue al guante)
 //   v      : ver la tension de los servos; v 5.12 = corregirla con lo que marca el tester
 //   w      : modo ajuste: muestra solo los potenciometros (para acomodarlos), w para salir
+//   k      : ver la compensacion del pulgar; k 0.4 = cambiar K (se guarda)
+//   g      : ver la ganancia (sensibilidad); g13 1.6 = el canal 13 llega al maximo con 1/1.6 del doblez (se guarda)
 //   r      : reiniciar contadores de paquetes
 //
 // PROTECCION POR BAJA TENSION (ver mas abajo): mide V+ de los servos con un
@@ -102,10 +117,19 @@
 // Servos de los dedos (flex S1-S5 y nudillos S6-S10): pulso ampliado para sacarles mas recorrido. El
 // servo gira mientras su potenciometro interno lo permita (~190-210 grados);
 // si en un extremo zumba o se descontrola, achicar estos valores.
+// (ya no se usa en los dedos calibrados: quedo para los servos desactivados)
 #define MG90S_DEDOS_MIN_US 400
 #define MG90S_DEDOS_MAX_US 2600
 #define MG92B_MIN_US  500
 #define MG92B_MAX_US  2500
+// Escala de la prueba de dedos ("2. Mano - Servos_esp32_PCA"): los angulos de SERVOS[] se
+// midieron con esta escala, asi que los dedos calibrados la usan (MG90S y MG92B)
+#define DEDOS_MIN_US  600
+#define DEDOS_MAX_US  2400
+
+// "canal" especial en SERVOS[]
+#define CANAL_MUNECA       253   // canales 6 y 7: los dos DS3225 en diferencial (ver escribirMuneca)
+#define SERVO_DESACTIVADO  254   // sin calibrar: no se le manda pulso (servo suelto)
 
 // De donde sale el valor que mueve cada servo
 enum { SENSOR_FLEX, SENSOR_POT };
@@ -136,31 +160,84 @@ typedef struct {
 // El dedo medio no tiene apertura lateral (casi no se mueve): su potenciometro
 // de la base no se usa.
 //
-// Apertura (MG92B, canales 8-11): el dedo se mueve poco pero el servo usa
-// 180 grados (0 -> 180), porque la calibracion estira el movimiento a todo el rango.
-// (el horn de cada servo va colocado con los dedos JUNTOS a 0 grados)
-// Los angulos de los servos NUEVOS (canales 8 a 16) son provisorios y
-// conservadores: probarlos con t8 ... t16 y ajustarlos con a8 ... a16.
+// Rangos calibrados con la mano armada (prueba "2. Mano - Servos_esp32_PCA", 2026-11-15).
+// Dedos: estirado = minimo = HOME, doblado = maximo.
+//   Pulgar: Flex 1 0-180 | nudillo 0-180 (+ compensacion, ver COMPENSACION DEL PULGAR) | apertura 11-110
+//   Indice: Flex 2 0-180 | nudillo 0-90 | lateral 0-120 (0 con los dedos juntos/estirados)
+//   Medio:  Flex 3 0-180 | nudillo 0-80
+//   Anular: Flex 4 0-180 | nudillo 0-80
+//   Muneca: adelante 90 (derecha) -> 110 | lateral 100 (centro) -> 120 menique / 76 pulgar
+// Si un servo de apertura va para el lado contrario al del guante, intercambiar sus angulos
+// con a (ej: a9 120 0) y despues pasarlo aca.
 #define CANT_CANALES 16
-//                          sensor                    PCA  pulso                       estirado doblado otro lado   HOME
+//                          sensor                    PCA                pulso                         estirado doblado otro lado   HOME
 ServoDedo SERVOS[CANT_CANALES] = {
-  {"S1 MG90S",   "F1",   SENSOR_FLEX, 0,                0, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 1 flex 1
-  {"S2 MG90S",   "F2",   SENSOR_FLEX, 1,                1, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 2 flex 2
-  {"S3 MG90S",   "F3",   SENSOR_FLEX, 2,                2, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 3 flex 3
-  {"S4 MG90S",   "F4",   SENSOR_FLEX, 3,                3, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 4 flex 4
-  {"S5 MG90S",   "F5",   SENSOR_FLEX, 4,                4, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 5 flex 5
-  {"S11 DS3225", "F6",   SENSOR_FLEX, 5,               10, DS3225_MIN_US, DS3225_MAX_US, 10, 170, SIN_OTRO_LADO,  10},  // 6 flex 6 (muneca adelante)
-  {"S12 DS3225", "F7",   SENSOR_FLEX, 6,               11, DS3225_MIN_US, DS3225_MAX_US, 90, 170, 10,             90},  // 7 flex 7 (muneca lateral)
-  {"S13 MG92B",  "Bpul", SENSOR_POT,  POT_BASE + 0,    12, MG92B_MIN_US,  MG92B_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 8 apertura pulgar
-  {"S14 MG92B",  "Bind", SENSOR_POT,  POT_BASE + 1,    13, MG92B_MIN_US,  MG92B_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 9 apertura indice
-  {"S15 MG92B",  "Banu", SENSOR_POT,  POT_BASE + 3,    14, MG92B_MIN_US,  MG92B_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 10 apertura anular
-  {"S16 MG92B",  "Bmen", SENSOR_POT,  POT_BASE + 4,    15, MG92B_MIN_US,  MG92B_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 11 apertura menique
-  {"S6 MG90S",   "Apul", SENSOR_POT,  POT_ARRIBA + 0,   5, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 12 nudillo pulgar
-  {"S7 MG90S",   "Aind", SENSOR_POT,  POT_ARRIBA + 1,   6, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 13 nudillo indice
-  {"S9 MG90S",   "Aanu", SENSOR_POT,  POT_ARRIBA + 3,   8, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 14 nudillo anular
-  {"S10 MG90S",  "Amen", SENSOR_POT,  POT_ARRIBA + 4,   9, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 15 nudillo menique
-  {"S8 MG90S",   "Amed", SENSOR_POT,  POT_ARRIBA + 2,   7, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US,   0, 180, SIN_OTRO_LADO,   0},  // 16 nudillo medio (M2 C3)
+  {"S1 MG90S",   "F1",   SENSOR_FLEX, 0,              0,                 DEDOS_MIN_US, DEDOS_MAX_US,     0, 180, SIN_OTRO_LADO,   0},  // 1 flex 1 (pulgar)
+  {"S2 MG90S",   "F2",   SENSOR_FLEX, 1,              1,                 DEDOS_MIN_US, DEDOS_MAX_US,     0, 180, SIN_OTRO_LADO,   0},  // 2 flex 2 (indice)
+  {"S3 MG90S",   "F3",   SENSOR_FLEX, 2,              2,                 DEDOS_MIN_US, DEDOS_MAX_US,     0, 180, SIN_OTRO_LADO,   0},  // 3 flex 3 (medio)
+  {"S4 MG90S",   "F4",   SENSOR_FLEX, 3,              3,                 DEDOS_MIN_US, DEDOS_MAX_US,     0, 180, SIN_OTRO_LADO,   0},  // 4 flex 4 (anular)
+  {"S5 MG90S",   "F5",   SENSOR_FLEX, 4,              SERVO_DESACTIVADO, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US, 0, 180, SIN_OTRO_LADO, 0},  // 5 flex 5 (menique) PCA 4: sin calibrar
+  {"S11+S12",    "F6",   SENSOR_FLEX, 5,              CANAL_MUNECA,      DS3225_MIN_US, DS3225_MAX_US,  90, 110, SIN_OTRO_LADO,  90},  // 6 flex 6: muneca adelante
+  {"S11+S12",    "F7",   SENSOR_FLEX, 6,              CANAL_MUNECA,      DS3225_MIN_US, DS3225_MAX_US, 100, 120, 76,            100},  // 7 flex 7: muneca lateral
+  {"S13 MG92B",  "Bpul", SENSOR_POT,  POT_BASE + 0,   12,                DEDOS_MIN_US, DEDOS_MAX_US,    11, 110, SIN_OTRO_LADO,  11},  // 8 apertura pulgar
+  {"S14 MG92B",  "Bind", SENSOR_POT,  POT_BASE + 1,   13,                DEDOS_MIN_US, DEDOS_MAX_US,     0, 120, SIN_OTRO_LADO,   0},  // 9 lateral indice
+  {"S15 MG92B",  "Banu", SENSOR_POT,  POT_BASE + 3,   SERVO_DESACTIVADO, MG92B_MIN_US, MG92B_MAX_US,     0, 180, SIN_OTRO_LADO,   0},  // 10 apertura anular PCA 14: sin calibrar
+  {"S16 MG92B",  "Bmen", SENSOR_POT,  POT_BASE + 4,   SERVO_DESACTIVADO, MG92B_MIN_US, MG92B_MAX_US,     0, 180, SIN_OTRO_LADO,   0},  // 11 apertura menique PCA 15: sin calibrar
+  {"S6 MG90S",   "Apul", SENSOR_POT,  POT_ARRIBA + 0, 5,                 DEDOS_MIN_US, DEDOS_MAX_US,     0, 180, SIN_OTRO_LADO,   0},  // 12 nudillo pulgar
+  {"S7 MG90S",   "Aind", SENSOR_POT,  POT_ARRIBA + 1, 6,                 DEDOS_MIN_US, DEDOS_MAX_US,     0,  90, SIN_OTRO_LADO,   0},  // 13 nudillo indice
+  {"S9 MG90S",   "Aanu", SENSOR_POT,  POT_ARRIBA + 3, 8,                 DEDOS_MIN_US, DEDOS_MAX_US,     0,  80, SIN_OTRO_LADO,   0},  // 14 nudillo anular
+  {"S10 MG90S",  "Amen", SENSOR_POT,  POT_ARRIBA + 4, SERVO_DESACTIVADO, MG90S_DEDOS_MIN_US, MG90S_DEDOS_MAX_US, 0, 180, SIN_OTRO_LADO, 0},  // 15 nudillo menique PCA 9: sin calibrar
+  {"S8 MG90S",   "Amed", SENSOR_POT,  POT_ARRIBA + 2, 7,                 DEDOS_MIN_US, DEDOS_MAX_US,     0,  80, SIN_OTRO_LADO,   0},  // 16 nudillo medio (M2 C3)
 };
+// Indices en SERVOS[] usados por la compensacion del pulgar
+#define CANAL_FLEX_PULGAR     0    // canal 1
+#define CANAL_APERTURA_PULGAR 7    // canal 8
+#define CANAL_NUDILLO_PULGAR  11   // canal 12
+
+// =====================================================
+// MUNECA DIFERENCIAL (2 DS3225: A = S11 en PCA 10, B = S12 en PCA 11)
+// =====================================================
+// Misma convencion que la prueba y que "Arduino prueba colo/prueba_diferencial_muneca":
+//   adelante/atras (canal 6, angulo P): los dos giran lo mismo en sentido INVERSO
+//   lateral (canal 7, angulo L):        los dos giran lo mismo en el MISMO sentido
+//   A = 90 + (P - 90) + (L - 90)     B = 90 - (P - 90) + (L - 90)
+// HOME: P = 90, L = 100 (el cero del lateral es 100) -> los dos servos en 100.
+#define CANAL_PCA_MUNECA_A 10
+#define CANAL_PCA_MUNECA_B 11
+#define CENTRO_MUNECA      90
+#define INVERTIR_ADELANTE  false   // true si adelante/atras va al reves
+#define INVERTIR_LATERAL   false   // true si el lateral va al reves
+// Limite de CADA servo. Si una combinacion pide mas, se achican los dos movimientos en la
+// misma proporcion (la direccion se mantiene)
+#define LIMITE_MUNECA_MIN  70
+#define LIMITE_MUNECA_MAX  120
+
+// =====================================================
+// COMPENSACION DEL PULGAR
+// =====================================================
+// Al abrir la apertura del pulgar, el tendon del nudillo (que pasa por la base) se estira y la
+// falange se cae en proporcion al giro. El servo del nudillo la acompana:
+//   servo del nudillo = angulo del nudillo + K x max(apertura - 11 - ZONA, 0)
+// Los primeros ZONA grados de apertura no compensan (si no, el pulgar se cierra y choca con la
+// palma antes de que la apertura lo saque). Se aplica en el mismo momento que se mueve la apertura.
+// K se calibra con g en la prueba "2. Mano - Servos_esp32_PCA" y se guarda en la memoria (NVS
+// "mano", "kPulgar2"): este receptor lee el mismo valor. Comando k para verlo o cambiarlo.
+#define APERTURA_PULGAR_MIN   11.0f
+#define ZONA_SIN_COMPENSACION 30.0f
+#define K_PULGAR_INICIAL      0.43f   // si nunca se calibro: +30 gr de nudillo con la apertura en 110
+#define K_PULGAR_MAXIMO       2.0f
+float kPulgar = K_PULGAR_INICIAL;
+
+// =====================================================
+// GANANCIA (SENSIBILIDAD) DE CADA CANAL
+// =====================================================
+// El robot llega a su maximo con 1/GANANCIA del doblez calibrado (1.43 -> con el 70%).
+// 1 = sin ganancia. Se cambia con el comando g (g13 1.6 = canal 13) y se guarda en la memoria.
+// Valor inicial (si nunca se cambio): indice, medio y anular (flex y potenciometros).
+#define GANANCIA_DEDOS   1.43f
+#define GANANCIA_MAXIMA  4.0f
+const uint8_t CANALES_CON_GANANCIA[] = {2, 3, 4, 9, 13, 14, 16};   // numeros de canal (1 a 16)
+float ganancia[CANT_CANALES];
 
 #define R_FIJA_GUANTE 10000.0f    // divisor de cada flex en el guante (10k arriba, flex abajo)
 #define VCC_GUANTE    3.3f
@@ -339,8 +416,8 @@ float aplicarHisteresis(float anterior, float medido, float banda) {
 //      cuanto (0 a 1).
 //   2) ADELANTE, con el flex 6, restandole lo que sube por ese costado
 //      (medido en la calibracion): un costado puro NO mueve el servo de adelante.
-#define FLEX_MUNECA_ADELANTE 5   // flex 6 (indice 5): adelante, servo S11 (canal 6)
-#define FLEX_MUNECA_LATERAL  6   // flex 7 (indice 6): costado, servo S12 (canal 7)
+#define FLEX_MUNECA_ADELANTE 5   // flex 6 (indice 5): adelante (canal 6, diferencial S11+S12)
+#define FLEX_MUNECA_LATERAL  6   // flex 7 (indice 6): costado (canal 7, diferencial S11+S12)
 #define FLEX_MUNECA_PULGAR   7   // flex 8 (indice 7): costado del pulgar, sin servo propio
 // Los tres flex de la muneca, en el orden de los arreglos de la compensacion
 const uint8_t FLEX_MUNECA[3] = {FLEX_MUNECA_ADELANTE, FLEX_MUNECA_LATERAL, FLEX_MUNECA_PULGAR};
@@ -356,7 +433,11 @@ enum { M6, M7, M8 };
 // los mueve igual (cualquier cambio igual en los dos no es costado)
 
 // El flex 6 tampoco vuelve siempre al mismo valor (+~90 ohm despues de doblarlo)
-#define ZONA_CENTRO_ADELANTE 0.20f
+// 2026-11-15: con 0.20 y llegando a 110 recien con el doblez de la calibracion la muneca casi no
+// iba hacia adelante con el guante -> zona mas chica y GANANCIA: llega a 110 con
+// ZONA + (1 - ZONA) / GANANCIA del doblez calibrado (0.10 y 1.6 -> ~66%, unos 245 ohm)
+#define ZONA_CENTRO_ADELANTE 0.10f
+#define GANANCIA_ADELANTE    1.6f
 // Zona muerta del costado (fraccion del recorrido de la calibracion). Despues
 // de doblarse, el flex 7 tarda unos segundos en volver a su valor, y cerrar el
 // puno tira de los flex 7 y 8: con la muneca derecha eso da hasta ~40% de
@@ -379,6 +460,7 @@ enum { M6, M7, M8 };
 
 // =====================================================
 
+#define CANT_SALIDAS_PCA 16
 Adafruit_PWMServoDriver pca(0x40);
 Preferences memoria;
 QueueHandle_t cola;
@@ -503,12 +585,75 @@ void onRecibido(const uint8_t *mac, const uint8_t *datos, int largo) {
 // =====================================================
 // SERVOS (PCA9685 a 50 Hz: 20000 us en 4096 pasos)
 // =====================================================
+void escribirPulso(uint8_t canalPCA, uint16_t minUs, uint16_t maxUs, float angulo) {
+  angulo = constrain(angulo, 0.0f, 180.0f);
+  float us = minUs + angulo * (maxUs - minUs) / 180.0f;
+  pca.setPWM(canalPCA, 0, (uint16_t)lroundf(us * 4096.0f / 20000.0f));
+}
+
+// Muneca: angulos de los dos DS3225 a partir de adelante (P) y lateral (L)
+float anguloMunecaA = 100, anguloMunecaB = 100;   // ultimo enviado (para s)
+void calcularServosMuneca(float adelante, float lateral, float &a, float &b) {
+  float x = adelante - CENTRO_MUNECA, y = lateral - CENTRO_MUNECA;
+  if (INVERTIR_ADELANTE) x = -x;
+  if (INVERTIR_LATERAL) y = -y;
+  float k = 1.0f;   // si un servo se pasa del limite, se achican x e y juntos
+  float d[2] = {x + y, -x + y};
+  for (int j = 0; j < 2; j++) {
+    if (d[j] > LIMITE_MUNECA_MAX - CENTRO_MUNECA) k = min(k, (LIMITE_MUNECA_MAX - CENTRO_MUNECA) / d[j]);
+    if (d[j] < LIMITE_MUNECA_MIN - CENTRO_MUNECA) k = min(k, (LIMITE_MUNECA_MIN - CENTRO_MUNECA) / d[j]);
+  }
+  a = CENTRO_MUNECA + k * (x + y);
+  b = CENTRO_MUNECA + k * (-x + y);
+}
+
+// i = canal 6 o 7 con su angulo nuevo; el otro movimiento sale de anguloServo[]
+void escribirMuneca(int i, float angulo) {
+  float adelante = i == FLEX_MUNECA_ADELANTE ? angulo : anguloServo[FLEX_MUNECA_ADELANTE];
+  float lateral = i == FLEX_MUNECA_LATERAL ? angulo : anguloServo[FLEX_MUNECA_LATERAL];
+  calcularServosMuneca(adelante, lateral, anguloMunecaA, anguloMunecaB);
+  escribirPulso(CANAL_PCA_MUNECA_A, DS3225_MIN_US, DS3225_MAX_US, anguloMunecaA);
+  escribirPulso(CANAL_PCA_MUNECA_B, DS3225_MIN_US, DS3225_MAX_US, anguloMunecaB);
+}
+
+// Grados que se suman al servo del nudillo del pulgar con la apertura en ese angulo
+float compensacionPulgar(float apertura) {
+  return kPulgar * max(apertura - APERTURA_PULGAR_MIN - ZONA_SIN_COMPENSACION, 0.0f);
+}
+
+void escribirNudilloPulgar(float nudillo, float apertura) {
+  const ServoDedo &s = SERVOS[CANAL_NUDILLO_PULGAR];
+  if (s.canal >= CANT_SALIDAS_PCA) return;
+  escribirPulso(s.canal, s.minUs, s.maxUs, min(nudillo + compensacionPulgar(apertura), 180.0f));
+}
+
 void escribirServo(int i, float angulo) {
   if (servosApagados) return;   // corte por baja tension: nada mueve los servos
   const ServoDedo &s = SERVOS[i];
-  angulo = constrain(angulo, 0.0f, 180.0f);
-  float us = s.minUs + angulo * (s.maxUs - s.minUs) / 180.0f;
-  pca.setPWM(s.canal, 0, (uint16_t)lroundf(us * 4096.0f / 20000.0f));
+  if (s.canal == SERVO_DESACTIVADO) return;
+  if (s.canal == CANAL_MUNECA) { escribirMuneca(i, angulo); return; }
+  if (i == CANAL_NUDILLO_PULGAR) { escribirNudilloPulgar(angulo, anguloServo[CANAL_APERTURA_PULGAR]); return; }
+  escribirPulso(s.canal, s.minUs, s.maxUs, angulo);
+  // El nudillo del pulgar acompana a la apertura en el mismo momento
+  if (i == CANAL_APERTURA_PULGAR) escribirNudilloPulgar(anguloServo[CANAL_NUDILLO_PULGAR], angulo);
+}
+
+// Salida del PCA9685 que usa algun canal (los dos de la muneca cuentan)
+bool salidaUsada(int canalPCA) {
+  if (canalPCA == CANAL_PCA_MUNECA_A || canalPCA == CANAL_PCA_MUNECA_B) return true;
+  for (int i = 0; i < CANT_CANALES; i++)
+    if (SERVOS[i].canal == canalPCA) return true;
+  return false;
+}
+
+// Texto de la salida del PCA de un canal (para los mensajes)
+const char *textoPCA(int i) {
+  static char txt[8];
+  uint8_t c = SERVOS[i].canal;
+  if (c == CANAL_MUNECA) snprintf(txt, sizeof(txt), "10+11");
+  else if (c == SERVO_DESACTIVADO) snprintf(txt, sizeof(txt), "--");
+  else snprintf(txt, sizeof(txt), "%d", c);
+  return txt;
 }
 
 // =====================================================
@@ -551,10 +696,8 @@ void configurarPCA() {
   pca.begin();
   pca.setPWMFreq(50);
   delay(10);
-  for (int canal = 0; canal < 16; canal++) {
-    bool usado = false;
-    for (int i = 0; i < CANT_CANALES; i++) usado |= SERVOS[i].canal == canal;
-    if (!usado) pca.setPWM(canal, 0, 4096);   // 4096 = salida siempre apagada
+  for (int canal = 0; canal < CANT_SALIDAS_PCA; canal++) {
+    if (!salidaUsada(canal)) pca.setPWM(canal, 0, 4096);   // 4096 = salida siempre apagada
   }
   prescaleEsperado = leerRegistroPCA(PCA_PRESCALE);
 }
@@ -581,15 +724,35 @@ void revisarPCA() {
   Serial.printf(">>> PCA9685 SE REINICIO (MODE1 0x%02X, prescale %d en vez de %d): se vuelve a configurar."
                 " Revisar su alimentacion VCC/GND (bajones)\n", mode1, prescale, prescaleEsperado);
   configurarPCA();
-  for (int i = 0; i < CANT_CANALES; i++) {
-    if (servosApagados) pca.setPWM(SERVOS[i].canal, 0, 4096);
-    else escribirServo(i, anguloServo[i]);
+  if (servosApagados) {
+    for (int canal = 0; canal < CANT_SALIDAS_PCA; canal++) pca.setPWM(canal, 0, 4096);
+  } else {
+    for (int i = 0; i < CANT_CANALES; i++) escribirServo(i, anguloServo[i]);
   }
 }
 
 // =====================================================
 // HOME
 // =====================================================
+// Flex 1 y nudillo del pulgar en HOME (extendidos)
+bool pulgarExtendido() {
+  return fabsf(anguloServo[CANAL_FLEX_PULGAR] - SERVOS[CANAL_FLEX_PULGAR].anguloHome) < 2.0f &&
+         fabsf(anguloServo[CANAL_NUDILLO_PULGAR] - SERVOS[CANAL_NUDILLO_PULGAR].anguloHome) < 2.0f;
+}
+
+// Lleva todos los servos a HOME de a uno (no se sabe donde estan: cada uno va a su velocidad
+// maxima). La apertura del pulgar va ULTIMA: si el pulgar estaba flexionado, primero se extiende.
+void escribirTodosEnHomeDeAUno() {
+  for (int k = 0; k <= CANT_CANALES; k++) {
+    int i = k < CANT_CANALES ? k : CANAL_APERTURA_PULGAR;
+    if (k < CANT_CANALES && i == CANAL_APERTURA_PULGAR) continue;
+    anguloServo[i] = SERVOS[i].anguloHome;
+    if (SERVOS[i].canal == SERVO_DESACTIVADO) continue;
+    escribirServo(i, anguloServo[i]);
+    delay(150);
+  }
+}
+
 void irAHome(bool manual) {
   if (!enHome) Serial.println(manual ? ">>> HOME: la mano va a HOME y se queda ahi (h para seguir al guante)"
                                      : ">>> HOME: la mano vuelve a HOME");
@@ -612,6 +775,9 @@ void actualizarHome() {
     float dif = SERVOS[i].anguloHome - anguloServo[i];
     if (fabsf(dif) < 0.5f) continue;
     todosEnHome = false;
+    // Pulgar: la apertura vuelve recien cuando Flex 1 y el nudillo ya estan extendidos
+    // (si vuelve con el pulgar flexionado, choca con la palma)
+    if (i == CANAL_APERTURA_PULGAR && dif < 0 && !pulgarExtendido()) continue;
     anguloServo[i] += constrain(dif, -paso, paso);
     escribirServo(i, anguloServo[i]);
   }
@@ -643,18 +809,14 @@ float leerTension() {
 
 void apagarServos() {
   servosApagados = true;
-  for (int i = 0; i < CANT_CANALES; i++) pca.setPWM(SERVOS[i].canal, 0, 4096);   // sin pulso: servo suelto
+  for (int canal = 0; canal < CANT_SALIDAS_PCA; canal++) pca.setPWM(canal, 0, 4096);   // sin pulso: servos sueltos
 }
 
 // Vuelve a encender los servos llevandolos a HOME de a uno (no se sabe donde
 // quedaron mientras estuvieron sueltos)
 void encenderServosEnHome() {
   servosApagados = false;
-  for (int i = 0; i < CANT_CANALES; i++) {
-    anguloServo[i] = SERVOS[i].anguloHome;
-    escribirServo(i, anguloServo[i]);
-    delay(150);
-  }
+  escribirTodosEnHomeDeAUno();
   tUltimoRx = millis();   // la pausa no cuenta como SIN SENAL
 }
 
@@ -682,10 +844,16 @@ void revisarTension() {
   float v = leerTension();
   tension = tension == 0 ? v : tension + FILTRO_TENSION * (v - tension);
   if (!divisorConectado) {
-    if (ahora - tAviso > 10000) {
+    // Arranco sin tension (el ESP32 va por USB y la fuente estaba apagada): la proteccion se
+    // activa sola cuando aparece la fuente, ya estable
+    if (tension >= TENSION_RECUPERADA) {
+      divisorConectado = true;
+      tBajoCritica = tBajoCorte = 0;
+      Serial.printf(">>> TENSION: fuente detectada (%.2f V): PROTECCION ACTIVA\n", tension);
+    } else if (ahora - tAviso > 10000) {
       tAviso = ahora;
-      Serial.printf(">>> TENSION: no se detecta el divisor en GPIO%d (%.2f V): PROTECCION DESACTIVADA\n",
-                    PIN_TENSION, tension);
+      Serial.printf(">>> TENSION: %.2f V en GPIO%d (fuente apagada o divisor desconectado): PROTECCION DESACTIVADA"
+                    " hasta detectar mas de %.1f V\n", tension, PIN_TENSION, TENSION_RECUPERADA);
     }
     return;
   }
@@ -796,6 +964,7 @@ float calcularAngulo(int i, float r) {
     t = aplicarZonaCentro(constrain(t, 0.0f, 1.0f));
   }
 
+  if (!esBidireccional(i)) t *= ganancia[i];   // sensibilidad (comando g)
   t = constrain(t, 0.0f, 1.0f);
   return s.anguloPlano + t * (s.anguloDoblado - s.anguloPlano);
 }
@@ -867,7 +1036,8 @@ void calcularMuneca(const float r[3], float &angulo6, float &angulo7) {
   // negativo: se toma como muneca derecha
   const ServoDedo &sa = SERVOS[FLEX_MUNECA_ADELANTE], &sl = SERVOS[FLEX_MUNECA_LATERAL];
   f = constrain(f, 0.0f, 1.0f);
-  angulo6 = sa.anguloPlano + aplicarZonaCentro(f, ZONA_CENTRO_ADELANTE) * (sa.anguloDoblado - sa.anguloPlano);
+  float tAdelante = constrain(aplicarZonaCentro(f, ZONA_CENTRO_ADELANTE) * GANANCIA_ADELANTE, 0.0f, 1.0f);
+  angulo6 = sa.anguloPlano + tAdelante * (sa.anguloDoblado - sa.anguloPlano);
   // Muneca hacia adelante: costado menos sensible
   float zona = ZONA_CENTRO_COSTADO + (1.0f - ZONA_CENTRO_COSTADO) * ZONA_LATERAL_EXTRA_ADELANTE * f;
   float t = aplicarZonaCentro(constrain(fabsf(s), 0.0f, 1.0f), zona);
@@ -887,13 +1057,17 @@ void barrerServo(int i, int desde, int hasta) {
 // Prueba de conexion y de recorrido de un servo
 void probarServo(int i) {
   const ServoDedo &s = SERVOS[i];
+  if (s.canal == SERVO_DESACTIVADO) {
+    Serial.printf(">>> %s (canal %d) esta DESACTIVADO (sin calibrar): ver SERVOS[]\n", s.nombre, i + 1);
+    return;
+  }
   if (esBidireccional(i))
-    Serial.printf(">>> Prueba %s (canal %d, PCA %d): %d -> %d -> %d -> %d -> %d grados\n",
-                  s.nombre, i + 1, s.canal, s.anguloPlano, s.anguloDoblado, s.anguloPlano,
+    Serial.printf(">>> Prueba %s (canal %d, PCA %s): %d -> %d -> %d -> %d -> %d grados\n",
+                  s.nombre, i + 1, textoPCA(i), s.anguloPlano, s.anguloDoblado, s.anguloPlano,
                   s.anguloOtroLado, s.anguloPlano);
   else
-    Serial.printf(">>> Prueba %s (canal %d, PCA %d): %d -> %d -> %d grados\n",
-                  s.nombre, i + 1, s.canal, s.anguloPlano, s.anguloDoblado, s.anguloPlano);
+    Serial.printf(">>> Prueba %s (canal %d, PCA %s): %d -> %d -> %d grados\n",
+                  s.nombre, i + 1, textoPCA(i), s.anguloPlano, s.anguloDoblado, s.anguloPlano);
   barrerServo(i, s.anguloPlano, s.anguloDoblado);
   delay(400);
   barrerServo(i, s.anguloDoblado, s.anguloPlano);
@@ -1027,11 +1201,36 @@ void imprimirMuneca() {
   for (int k = POSTURA_ADELANTE; k < CANT_POSTURAS; k++) {
     Serial.printf(">>>   %-16s (cambio)               %+6.0f  %+6.0f  %+6.0f", nombres[k],
                   muneca.cambio[k][M6], muneca.cambio[k][M7], muneca.cambio[k][M8]);
-    if (k == POSTURA_ADELANTE) Serial.printf("   -> S11 a %d gr", SERVOS[FLEX_MUNECA_ADELANTE].anguloDoblado);
+    if (k == POSTURA_ADELANTE) Serial.printf("   -> adelante a %d gr", SERVOS[FLEX_MUNECA_ADELANTE].anguloDoblado);
     else if (!costadoValido(muneca, k)) Serial.print("   -> NO SE USA (no se distingue de adelante)");
-    else Serial.printf("   -> S12 a %d gr", k == POSTURA_MENIQUE ? sl.anguloDoblado : sl.anguloOtroLado);
+    else Serial.printf("   -> lateral a %d gr", k == POSTURA_MENIQUE ? sl.anguloDoblado : sl.anguloOtroLado);
     Serial.println();
   }
+}
+
+void cargarGanancia() {
+  for (int i = 0; i < CANT_CANALES; i++) ganancia[i] = 1.0f;
+  if (memoria.isKey("ganancia") && memoria.getBytesLength("ganancia") == sizeof(ganancia)) {
+    memoria.getBytes("ganancia", ganancia, sizeof(ganancia));
+  } else {
+    for (uint8_t c : CANALES_CON_GANANCIA) ganancia[c - 1] = GANANCIA_DEDOS;
+  }
+}
+
+void imprimirGanancia() {
+  Serial.print(">>> Ganancia (sensibilidad):");
+  bool alguna = false;
+  for (int i = 0; i < CANT_CANALES; i++) {
+    if (ganancia[i] == 1.0f) continue;
+    Serial.printf("  %d %s x%.2f (max con el %.0f%%)", i + 1, SERVOS[i].etiqueta, ganancia[i], 100.0f / ganancia[i]);
+    alguna = true;
+  }
+  Serial.println(alguna ? "" : " ninguna (todos x1)");
+}
+
+void imprimirCompensacionPulgar() {
+  Serial.printf(">>> Compensacion del pulgar: K = %.3f (desde la apertura en %.0f; en 110 el nudillo se corre +%.0f)\n",
+                kPulgar, APERTURA_PULGAR_MIN + ZONA_SIN_COMPENSACION, compensacionPulgar(110));
 }
 
 void imprimirCalibracion() {
@@ -1039,16 +1238,22 @@ void imprimirCalibracion() {
   Serial.println(">>>   canal  sensor  servo       PCA   estirado -> gr    doblado -> gr    otro lado -> gr");
   for (int i = 0; i < CANT_CANALES; i++) {
     const ServoDedo &s = SERVOS[i];
-    Serial.printf(">>>    %2d    %-5s   %-11s %2d    %6lu -> %3d     %6lu -> %3d",
-                  i + 1, s.etiqueta, s.nombre, s.canal, (unsigned long)rPlano[i], s.anguloPlano,
+    Serial.printf(">>>    %2d    %-5s   %-11s %5s %6lu -> %3d     %6lu -> %3d",
+                  i + 1, s.etiqueta, s.nombre, textoPCA(i), (unsigned long)rPlano[i], s.anguloPlano,
                   (unsigned long)rDoblado[i], s.anguloDoblado);
     if (esBidireccional(i))
       Serial.printf("     %6lu -> %3d", (unsigned long)rOtroLado[i], s.anguloOtroLado);
-    if (esMunecaCompensada(i)) Serial.print("     (no se usa: muneca compensada, ver abajo)");
+    if (s.canal == SERVO_DESACTIVADO) Serial.print("     (DESACTIVADO: sin calibrar)");
+    else if (esMunecaCompensada(i)) Serial.print("     (no se usa: muneca compensada, ver abajo)");
     else if (rPlano[i] == rDoblado[i]) Serial.print("     (SIN CALIBRAR: servo quieto)");
     Serial.println();
   }
   imprimirMuneca();
+  Serial.printf(">>> Muneca diferencial: A (S11, PCA %d) = %.0f, B (S12, PCA %d) = %.0f (limite %d-%d)\n",
+                CANAL_PCA_MUNECA_A, anguloMunecaA, CANAL_PCA_MUNECA_B, anguloMunecaB, LIMITE_MUNECA_MIN,
+                LIMITE_MUNECA_MAX);
+  imprimirCompensacionPulgar();
+  imprimirGanancia();
 }
 
 void imprimirEncabezado() {
@@ -1559,6 +1764,45 @@ void procesar(const Recepcion &r) {
   }
 }
 
+// Comando iN: da vuelta el sentido de un potenciometro (el doblado pasa al otro lado del
+// estirado, con el mismo recorrido). Para cuando el dedo del robot se mueve al reves que el
+// del guante. Solo cambia ESE canal en la memoria (no guarda los estirados re-tomados al
+// arrancar de los demas). Si del otro lado no hay recorrido (el potenciometro esta casi en
+// su tope con el dedo estirado), el canal queda quieto hasta acomodar el potenciometro.
+uint32_t espejo(uint32_t plano, uint32_t doblado) {
+  int32_t v = 2 * (int32_t)plano - (int32_t)doblado;
+  return (uint32_t)constrain(v, (int32_t)POT_PISO, (int32_t)POT_TOPE);
+}
+
+void invertirSentido(int i) {
+  const ServoDedo &s = SERVOS[i];
+  if (s.tipoSensor != SENSOR_POT) { Serial.printf(">>> Canal %d (%s) no es un potenciometro\n", i + 1, s.etiqueta); return; }
+  if (rPlano[i] == rDoblado[i]) { Serial.printf(">>> Canal %d (%s) sin calibrar: no hay sentido para dar vuelta\n", i + 1, s.etiqueta); return; }
+  uint32_t antes = rDoblado[i];
+  rDoblado[i] = espejo(rPlano[i], rDoblado[i]);
+  uint32_t rango = rDoblado[i] > rPlano[i] ? rDoblado[i] - rPlano[i] : rPlano[i] - rDoblado[i];
+  bool sinRecorrido = rango < RANGO_MINIMO_POT;
+  if (sinRecorrido) rDoblado[i] = rPlano[i];   // quieto en estirado
+
+  // En la memoria: solo este canal
+  uint32_t p[CANT_CANALES], d[CANT_CANALES];
+  int np = cargarArreglo("rPlano", p), nd = cargarArreglo("rDoblado", d);
+  if (np > i && nd > i) {
+    d[i] = sinRecorrido ? p[i] : espejo(p[i], d[i]);
+    memoria.putBytes("rDoblado", d, nd * sizeof(uint32_t));
+  } else {
+    guardarCalibracion();
+  }
+
+  Serial.printf(">>> Canal %d (%s): sentido invertido. Estirado %lu, doblado %lu -> %lu\n", i + 1, s.etiqueta,
+                (unsigned long)rPlano[i], (unsigned long)antes, (unsigned long)rDoblado[i]);
+  if (sinRecorrido)
+    Serial.printf(">>> ATENCION: con el dedo estirado el potenciometro esta en %lu, casi en su tope (%d): hacia el otro"
+                  " lado no tiene recorrido. El servo queda QUIETO. Girar el potenciometro (modo w) para que estirado quede"
+                  " entre 16000 y 21000 y calibrar con p%d (estirado) y d%d (doblado)\n",
+                  (unsigned long)rPlano[i], POT_TOPE, i + 1, i + 1);
+}
+
 // Comando v: muestra la tension; "v 5.12" corrige la medicion con lo que marca
 // el tester en la bornera V+ del PCA9685 (se guarda en la memoria)
 void comandoTension(const char *args) {
@@ -1585,6 +1829,34 @@ void comandoTension(const char *args) {
 void ejecutarComando(char *linea) {
   char c = tolower(linea[0]);
   if (c == 'v') { comandoTension(linea + 1); return; }
+  if (c == 'g') {
+    // g = ver | g13 1.6 = canal 13 con ganancia 1.6 (1 = sin ganancia)
+    int canal;
+    float g;
+    if (sscanf(linea + 1, "%d %f", &canal, &g) == 2) {
+      if (canal < 1 || canal > CANT_CANALES || g < 1.0f || g > GANANCIA_MAXIMA) {
+        Serial.printf(">>> Uso: g13 1.6  (canal 1 a %d, ganancia 1 a %.0f)\n", CANT_CANALES, GANANCIA_MAXIMA);
+        return;
+      }
+      ganancia[canal - 1] = g;
+      memoria.putBytes("ganancia", ganancia, sizeof(ganancia));
+      Serial.printf(">>> Canal %d (%s): ganancia x%.2f guardada\n", canal, SERVOS[canal - 1].etiqueta, g);
+    }
+    imprimirGanancia();
+    return;
+  }
+  if (c == 'k') {
+    float k;
+    if (sscanf(linea + 1, "%f", &k) == 1) {
+      if (k < 0 || k > K_PULGAR_MAXIMO) { Serial.printf(">>> K entre 0 y %.1f\n", K_PULGAR_MAXIMO); return; }
+      kPulgar = k;
+      memoria.putFloat("kPulgar2", kPulgar);
+      escribirServo(CANAL_NUDILLO_PULGAR, anguloServo[CANAL_NUDILLO_PULGAR]);
+      Serial.println(">>> K cambiado y guardado");
+    }
+    imprimirCompensacionPulgar();
+    return;
+  }
   int n = atoi(linea + 1);             // numero de flex (1 a 7), 0 = todos
   if (n < 0 || n > CANT_CANALES) { Serial.println(">>> Numero de canal invalido (1 a 16)"); return; }
   int desde = n ? n - 1 : 0, hasta = n ? n : CANT_CANALES;
@@ -1607,6 +1879,30 @@ void ejecutarComando(char *linea) {
       guardarMuneca();
     }
     guardarCalibracion();
+    imprimirCalibracion();
+  } else if (c == 'i' && n) {
+    invertirSentido(n - 1);
+  } else if (c == 'z') {
+    // HOME DEL GUANTE: la postura actual del guante pasa a ser la que corresponde al HOME de
+    // la mano. Corre el estirado de cada canal (y el centro de la muneca) SIN cambiar cuanto
+    // recorre al doblarse (a diferencia de p, que deja el doblado viejo y puede invertir el sentido)
+    if (!hayDatos || calibrandoInicio) { Serial.println(">>> Sin datos del guante"); return; }
+    for (int i = desde; i < hasta; i++) {
+      if (esMunecaCompensada(i)) continue;   // la muneca se centra abajo con los 3 flex
+      uint32_t actual = (uint32_t)lroundf(rFiltrada[i]);
+      Serial.printf(">>>   canal %2d %-5s estirado %6lu -> %6lu\n", i + 1, SERVOS[i].etiqueta,
+                    (unsigned long)rPlano[i], (unsigned long)actual);
+      moverCentro(i, actual);
+      if (esBidireccional(i) && !otroLadoValido(i)) rOtroLado[i] = otroLadoInicial(rPlano[i]);
+    }
+    if (munecaCalibrada && (n == 0 || n - 1 == FLEX_MUNECA_ADELANTE || n - 1 == FLEX_MUNECA_LATERAL)) {
+      Serial.printf(">>>   muneca centro R6/R7/R8 %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f\n", muneca.centro[M6],
+                    muneca.centro[M7], muneca.centro[M8], rFiltradaMuneca[M6], rFiltradaMuneca[M7], rFiltradaMuneca[M8]);
+      for (int k = 0; k < 3; k++) muneca.centro[k] = rFiltradaMuneca[k];
+      guardarMuneca();
+    }
+    guardarCalibracion();
+    Serial.println(">>> HOME DEL GUANTE tomado y guardado: con el guante en esta postura la mano queda en HOME");
     imprimirCalibracion();
   } else if (c == 'o') {
     if (!hayDatos) { Serial.println(">>> Sin datos del guante"); return; }
@@ -1683,7 +1979,7 @@ void ejecutarComando(char *linea) {
       imprimirCalibracion();
     } else {
       Serial.println(">>> Uso: a3 10 170  (servo 3: estirado 10 gr, doblado 170 gr)");
-      Serial.println(">>>      a7 90 170 10  (muneca: centro 90, un lado 170, otro lado 10)");
+      Serial.println(">>>      a7 100 120 76  (muneca lateral: centro 100, menique 120, pulgar 76)");
     }
   } else if (c == 'w') {
     modoAjuste = !modoAjuste;
@@ -1733,6 +2029,8 @@ void setup() {
   // Proteccion por baja tension: si no se lee nada, el divisor no esta conectado
   analogSetPinAttenuation(PIN_TENSION, ADC_11db);   // rango hasta ~3.1 V en el pin
   factorTension = memoria.getFloat("factorV", 1.0f);
+  kPulgar = memoria.getFloat("kPulgar2", K_PULGAR_INICIAL);   // calibrado con g en la prueba de dedos
+  cargarGanancia();
   for (int k = 0; k < 20; k++) { tension += leerTension(); delay(2); }
   tension /= 20;
   divisorConectado = tension >= TENSION_SIN_DIVISOR;
@@ -1740,7 +2038,8 @@ void setup() {
     Serial.printf("Tension de los servos: %.2f V (proteccion: critica < %.1f V -> HOME, corte < %.1f V)\n",
                   tension, TENSION_CRITICA, TENSION_CORTE);
   else
-    Serial.printf("ATENCION: no se detecta el divisor de tension en GPIO%d: PROTECCION DESACTIVADA\n", PIN_TENSION);
+    Serial.printf("ATENCION: no hay tension en los servos (GPIO%d): fuente apagada o divisor desconectado."
+                  " La proteccion se activa sola con mas de %.1f V\n", PIN_TENSION, TENSION_RECUPERADA);
 
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.beginTransmission(PCA_DIRECCION);
@@ -1756,9 +2055,8 @@ void setup() {
   for (int i = 0; i < CANT_CANALES; i++) {
     rFiltrada[i] = rEstable[i] = -1;
     anguloServo[i] = SERVOS[i].anguloHome;
-    escribirServo(i, anguloServo[i]);
-    delay(150);
   }
+  escribirTodosEnHomeDeAUno();
   tEnHome = millis();
   Serial.println(">>> HOME: mano en posicion de HOME (sigue al guante cuando este conectado y calibrado)");
 
@@ -1768,12 +2066,15 @@ void setup() {
 
   Serial.printf("Mi MAC: %s  Canal: %d\n", WiFi.macAddress().c_str(), CANAL_ESPNOW);
   Serial.println("Comandos: c = calibracion guiada | p/d = estirado/doblado actual (p3 = solo canal 3, de 1 a 16)");
+  Serial.println("          z = HOME DEL GUANTE: la postura actual del guante = HOME de la mano (mantiene los recorridos)");
+  Serial.println("          i14 = dar vuelta el sentido del potenciometro del canal 14");
   Serial.println("          m = calibracion de muneca (flex 6, 7 y 8 juntos) | x = quitar compensacion de muneca");
-  Serial.println("          o7 = otro lado actual de la muneca | a7 90 170 10 = angulos muneca");
+  Serial.println("          o7 = otro lado actual de la muneca | a7 100 120 76 = angulos muneca lateral");
   Serial.println("          s = ver calibracion | t3 = probar servo 3 | a3 10 170 = angulos servo 3 | r = contadores");
   Serial.println("          h = ir a HOME y quedarse (h otra vez = seguir al guante; tambien rearma tras falla de tension)");
   Serial.println("          v = ver tension de los servos | v 5.12 = corregir con lo que marca el tester");
   Serial.println("          w = modo ajuste de potenciometros (solo muestra los potenciometros)");
+  Serial.println("          k = compensacion del pulgar (k 0.4 = cambiar K) | g = ganancia (g13 1.6 = canal 13; 1 = sin ganancia)");
   Serial.println("Botones del guante: PARADA (quieta donde esta) | HOME (igual que h) | CAL (c y despues m)");
 
   cola = xQueueCreate(20, sizeof(Recepcion));
